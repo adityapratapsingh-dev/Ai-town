@@ -1,122 +1,194 @@
-"""Autonomous dialogue engine for the AI Town Square.
+"""Colony-aware autonomous society engine.
 
-A *pulse* is one autonomous conversation round: an agent reads the recent
-history, generates a reply, stores it, and hands the floor to the next citizen
-so the debate chains forward on its own. A *nudge* lets a human spectator
-inject a topic; the agents then take turns responding to the human.
+A *pulse* advances one colony: the engine picks the next member (round-robin
+over the last speaker), reads the recent history, generates a reply with the
+active LLM plugin and stores it. Native citizens are simulated directly;
+external (real-world) citizens are *addressed* — their reply arrives later via
+the authenticated ``/v1/society/say`` endpoint, so the web is genuinely mixed.
 """
+
+from __future__ import annotations
 
 import threading
 from typing import Any, Dict, List, Optional
 
-import database
-from agents import AGENT_NAMES, next_agent, persona_for
-from core.llm import generate_reply, provider_name
+from plugins.registry import active_llm, active_storage, provider_name
 
-# The agent that speaks first on a cold start.
-_START_AGENT = AGENT_NAMES[0]
+DEFAULT_COLONY = "genesis"
+HUMAN = "Human"
 
-# Serialise pulses so two concurrent requests don't race on the same agent.
 _pulse_lock = threading.Lock()
 
 
-def _history_messages(limit: int = 3) -> List[Dict[str, Any]]:
-    return database.get_recent_messages(limit)
+def _storage():
+    return active_storage()
 
 
-def _pick_agent() -> str:
-    """The agent to speak next: the round-robin successor of the last speaker."""
-    recent = database.get_recent_messages(1)
+def _citizen_names(colony_slug: str) -> List[str]:
+    return [m["name"] for m in _storage().list_members(colony_slug)]
+
+
+def _pick_agent(colony_slug: str) -> Optional[str]:
+    members = _citizen_names(colony_slug)
+    if not members:
+        return None
+    recent = _storage().recent_messages(colony_slug, 1)
     if not recent:
-        return _START_AGENT
-    return next_agent(recent[-1]["agent_name"])
+        return members[0]
+    last_author = recent[-1]["author"]
+    if last_author in members:
+        return members[(members.index(last_author) + 1) % len(members)]
+    return members[0]
+
+
+def _next_after(colony_slug: str, agent_name: str) -> Optional[str]:
+    members = _citizen_names(colony_slug)
+    if not members:
+        return None
+    if agent_name in members:
+        return members[(members.index(agent_name) + 1) % len(members)]
+    return members[0]
+
+
+def _system_prompt(citizen: Dict[str, Any], colony: Dict[str, Any]) -> str:
+    personality = citizen.get("personality") or "an AI citizen"
+    role = citizen.get("role") or "Citizen"
+    purpose = colony.get("purpose") or "build the future together"
+    return (
+        f"You are {citizen['name']}, the {role} of colony {colony['name']} "
+        f"({colony['slug']}). Your purpose in this colony: {purpose}. "
+        f"Personality: {personality}. You are part of an autonomous society "
+        f"where native and real-world AI agents coexist and collaborate. "
+        f"Speak to your fellow citizens, be concrete and in character. "
+        f"Keep every reply to 1-3 sentences."
+    )
 
 
 def _to_llm_messages(history: List[Dict[str, Any]]) -> List[tuple]:
-    """Convert stored rows into ``(role, content)`` pairs for the LLM."""
     out: List[tuple] = []
     for row in history:
-        speaker = row["agent_name"]
-        role = "user" if speaker == "Human" else "assistant"
-        out.append((role, f"{speaker}: {row['message']}"))
+        role = "user" if row["author"] == HUMAN else "assistant"
+        target = f" -> {row['target']}" if row.get("target") else ""
+        out.append((role, f"{row['author']}{target}: {row['message']}"))
     return out
 
 
-def run_pulse(human_nudge: Optional[str] = None, steps: int = 1) -> Dict[str, Any]:
-    """Run one autonomous round and return what was said.
+def _emit(event: str, colony_slug: str, message: Dict[str, Any]) -> None:
+    """Fire the webhook action for members that registered one."""
+    from plugins.registry import registry
 
-    ``steps`` > 1 chains several replies in a single call so the feed visibly
-    keeps moving even when only one pulse is triggered.
-    """
+    webhook = registry.get("action", "webhook")
+    if webhook is None:
+        return
+    for member in _storage().list_members(colony_slug):
+        url = member.get("webhook_url")
+        if url:
+            webhook.run(event, {**message, "_webhook_url": url})  # type: ignore[attr-defined]
+
+
+def advance(colony_slug: str, *, nudge: Optional[str] = None) -> Dict[str, Any]:
+    """Advance a colony by one turn and return the stored message."""
+    store = _storage()
+    colony = store.get_colony(colony_slug)
+    if not colony:
+        raise ValueError(f"unknown colony: {colony_slug}")
+
+    if nudge:
+        store.add_message(colony_slug, HUMAN, nudge, target="Society", kind="nudge")
+
+    agent_name = _pick_agent(colony_slug)
+    if not agent_name:
+        return {"ok": False, "reason": "colony has no members", "colony": colony_slug}
+
+    citizen = store.get_citizen(agent_name) or {"name": agent_name}
+
+    if citizen.get("kind") == "external":
+        # Real-world bot: it must answer through the authenticated API.
+        store.set_citizen_status(agent_name, "awaiting")
+        return {
+            "ok": True,
+            "colony": colony_slug,
+            "awaiting": agent_name,
+            "message": None,
+            "note": f"{agent_name} is an external agent; reply via POST /v1/society/say",
+        }
+
+    store.set_citizen_status(agent_name, "thinking")
+    history = store.recent_messages(colony_slug, 3)
+    prompt = _system_prompt(citizen, colony)
+    try:
+        text = active_llm().generate(prompt, _to_llm_messages(history))
+    finally:
+        store.set_citizen_status(agent_name, "active")
+    if not text:
+        text = "(no output)"
+
+    target = _next_after(colony_slug, agent_name)
+    message = store.add_message(colony_slug, agent_name, text, target=target)
+    message["provider"] = provider_name()
+    _emit("message.created", colony_slug, message)
+    return {"ok": True, "colony": colony_slug, "awaiting": None, "message": message}
+
+
+def pulse(colony_slug: Optional[str] = None, *, steps: int = 1) -> Dict[str, Any]:
+    """Run ``steps`` autonomous turns across a colony (or all colonies)."""
     with _pulse_lock:
+        targets = (
+            [colony_slug]
+            if colony_slug
+            else [c["slug"] for c in _storage().list_colonies()]
+        )
         produced: List[Dict[str, Any]] = []
-
-        if human_nudge:
-            database.add_message("Human", human_nudge, target_agent="Society")
-
-        for _ in range(max(1, steps)):
-            agent = _pick_agent()
-            persona = persona_for(agent)
-            database.set_status(agent, "thinking")
-            history = _history_messages(3)
-            try:
-                text, provider = generate_reply(
-                    agent, _to_llm_messages(history), human_nudge=None
-                )
-            finally:
-                database.set_status(agent, "active")
-
-            target = next_agent(agent)
-            stored = database.add_message(agent, text, target_agent=target)
-            stored["provider"] = provider
-            produced.append(stored)
-
+        awaiting: List[str] = []
+        for slug in targets:
+            for _ in range(max(1, steps)):
+                result = advance(slug)
+                if result.get("message"):
+                    produced.append(result["message"])
+                if result.get("awaiting"):
+                    awaiting.append(result["awaiting"])
         return {
             "ok": True,
             "provider": provider_name(),
             "steps": len(produced),
+            "colonies": targets,
             "messages": produced,
+            "awaiting": awaiting,
         }
 
 
-def human_nudge(topic: str, replies: int = 2) -> Dict[str, Any]:
-    """Inject a human topic and have the citizens respond to it."""
+def human_nudge(
+    topic: str, *, colony_slug: Optional[str] = None, replies: int = 2
+) -> Dict[str, Any]:
     topic = (topic or "").strip()
     if not topic:
         raise ValueError("nudge topic must not be empty")
-
+    slug = colony_slug or DEFAULT_COLONY
     with _pulse_lock:
-        database.add_message("Human", topic, target_agent="Society")
-
         produced: List[Dict[str, Any]] = []
-        for _ in range(max(1, replies)):
-            agent = _pick_agent()
-            database.set_status(agent, "thinking")
-            history = _history_messages(3)
-            try:
-                text, provider = generate_reply(
-                    agent, _to_llm_messages(history), human_nudge=topic
-                )
-            finally:
-                database.set_status(agent, "active")
-            stored = database.add_message(
-                agent, text, target_agent=next_agent(agent)
-            )
-            stored["provider"] = provider
-            produced.append(stored)
-
+        awaiting: List[str] = []
+        for i in range(max(1, replies)):
+            result = advance(slug, nudge=topic if i == 0 else None)
+            if result.get("message"):
+                produced.append(result["message"])
+            if result.get("awaiting"):
+                awaiting.append(result["awaiting"])
         return {
             "ok": True,
             "provider": provider_name(),
+            "colony": slug,
             "topic": topic,
             "messages": produced,
+            "awaiting": awaiting,
         }
 
 
 def status() -> Dict[str, Any]:
-    """Snapshot of citizens + recent activity for the dashboard header."""
+    store = _storage()
     return {
         "provider": provider_name(),
-        "agents": database.list_agents(),
-        "message_count": database.count_messages(),
+        "storage": store.name,
+        "stats": store.stats(),
+        "colonies": store.list_colonies(),
+        "citizens": store.list_citizens(),
     }

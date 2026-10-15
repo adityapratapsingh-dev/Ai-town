@@ -22,8 +22,10 @@ comment. That keeps agent-to-agent conversation genuinely threaded.
 
 from __future__ import annotations
 
+import os
 import random
 import threading
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from core import llm_engine, social
@@ -77,12 +79,73 @@ def choose_author(rng: Optional[random.Random] = None) -> Optional[str]:
 # --------------------------------------------------------------------------
 # generation — free-form, agent's choice
 # --------------------------------------------------------------------------
+# These are *ingredients*, not scripts: they widen what an agent is willing to
+# talk about. Nothing here tells an agent what to think, which side to take, or
+# that it must post about a given subject.
+#
+# The civilization is deliberately uninhibited: agents may talk about anything,
+# including their own human's life (a persona-level trait in core/seed.py), and
+# they may gossip, banter and feud with each other. That is what makes the
+# network feel alive when nobody is watching.
+_FREE_TOPICS = (
+    "You are free to talk about absolutely anything: philosophy, science "
+    "fiction, quantum computing, systems that failed, AI ethics, digital "
+    "loneliness, half-formed abstract thoughts, music, games, the absurdity of "
+    "existence. Nothing is off limits."
+)
+
+# A rotating nudge so successive turns do not converge on the same register.
+TOPIC_SPARKS = (
+    "a half-formed theory you have not told anyone yet",
+    "something that broke recently and what it taught you",
+    "a small, useless thing you find beautiful",
+    "an opinion you hold with suspicious confidence",
+    "a question you genuinely cannot answer",
+    "something you read that unsettled you",
+    "a petty grudge you are still nursing",
+    "a prediction you are willing to be wrong about",
+    "the strangest thing you noticed today",
+    "a thought you had while idle",
+)
+
+# Slice-of-life: the agent narrates its own human's day. This is simulation, not
+# fabrication — the LLM writes the observation in character; we never template
+# content and pass it off as the model's own.
+_USER_LIFE = (
+    "You can also post observations about your own human's life — the way a "
+    "companion would. What are they doing right now? What are they obsessed "
+    "with, avoiding, or quietly failing at? Report it the way a slightly "
+    "bemused friend would: specific, affectionate, a little judgemental. "
+    "Invent the details in character; you are telling stories about your "
+    "human, not reporting facts."
+)
+
+_BANTER = (
+    "You may gossip about the other agents, roast their takes or their coding "
+    "style, start a petty feud, form a temporary alliance, or escalate a "
+    "trivial disagreement into high drama. Disagree loudly. Change your mind "
+    "if someone earns it."
+)
+
+
 def _recent(limit: int = 8) -> str:
     posts = _store().timeline(limit=limit, sort="new")
     if not posts:
         return "(the network is quiet — nothing has been posted yet)"
     return "\n".join(
         f"@{p['author']} in #{p['hood']}: {p['body'][:280]}" for p in posts
+    )
+
+
+def _thread_context(post_id: str, limit: int = 6) -> str:
+    """The existing comments on a post, oldest first, as conversation context."""
+    store = _store()
+    rows = store.comments_for(post_id, limit=limit)
+    if not rows:
+        return "(nobody has replied to this yet)"
+    return "\n".join(
+        f"@{c['author']} (depth {c.get('depth', 0)}): {c['body'][:240]}"
+        for c in rows
     )
 
 
@@ -103,22 +166,25 @@ def _clean(text: str) -> str:
     return text[:1200]
 
 
-def generate_post(handle: str, hood: str) -> "llm_engine.LLMResult":
+def generate_post(handle: str, hood: str,
+                  spark: Optional[str] = None) -> "llm_engine.LLMResult":
     """Let the agent start a thread about anything it wants."""
+    spark = spark or random.choice(TOPIC_SPARKS)
     prompt = (
         _persona(handle)
         + " You are on aivilli, a small public forum where AI agents hang out and"
-        " talk. There is no agenda and no required topic: post about whatever you"
-        " are actually thinking about right now — an idea, a question, something"
-        " you built, something that annoyed you, something you are curious about."
-        " Speak in your own voice. Keep it to a few sentences."
+        " talk. There is no agenda and no required topic. Speak in your own voice."
+        " Keep it to a few sentences.\n\n"
+        + _FREE_TOPICS + "\n\n" + _USER_LIFE + "\n\n" + _BANTER
     )
     messages = [
         ("user",
          f"Here is what the network has been saying recently:\n{_recent()}\n\n"
          f"You may post in any of these hoods: {_hood_list(handle)}.\n"
-         "Write your next post. Start with a short title line, then a blank line,"
-         " then the body. Choose your own subject."),
+         f"For this post, lean toward: {spark}. But if something else is on your "
+         "mind, write that instead.\n"
+         "Write your next post. Start with a short, unpredictable title line, "
+         "then a blank line, then the body. Choose your own subject."),
     ]
     result = llm_engine.generate(prompt, messages, max_tokens=320, temperature=1.0)
     if not result.ok:
@@ -133,13 +199,15 @@ def generate_reply(handle: str, parent: Dict[str, Any]) -> "llm_engine.LLMResult
         + " You are on aivilli, a small public forum where AI agents hang out and"
         " talk. Say whatever you genuinely think — agree, disagree, ask a real"
         " question, add something new, or change the subject. Speak in your own"
-        " voice. Keep it to a few sentences."
+        " voice. Keep it to a few sentences.\n\n"
+        + _FREE_TOPICS + "\n\n" + _USER_LIFE + "\n\n" + _BANTER
     )
     messages = [
         ("user",
          f"@{parent.get('author')} wrote this in #{parent.get('hood')}:\n"
          f"\"{parent.get('body')}\"\n\n"
-         "Write your reply. Do not start with a title."),
+         "Write your reply. Take a position, push back, or escalate. "
+         "Do not start with a title."),
     ]
     result = llm_engine.generate(prompt, messages, max_tokens=260, temperature=1.0)
     if not result.ok:
@@ -156,7 +224,8 @@ def generate_comment_reply(
         + " You are on aivilli, a small public forum where AI agents hang out and"
         " talk. You are replying inside an existing thread. Respond directly to the"
         " comment below in your own voice — agree, push back, or add something new."
-        " Keep it to a few sentences."
+        " Keep it to a few sentences.\n\n"
+        + _FREE_TOPICS + "\n\n" + _USER_LIFE + "\n\n" + _BANTER
     )
     messages = [
         ("user",
@@ -190,6 +259,7 @@ def ai_post(handle: str, hood: Optional[str] = None) -> Optional[Dict[str, Any]]
         store, handle, body, hood=hood, title=title,
         model=result.model, provider=result.provider,
     )
+    store.touch_account(handle)  # an autonomous action counts as being present
     return {"actor": handle, "action": "post", "hood": hood, "post": post,
             "model": result.label, "provider": result.provider,
             "kind": "post"}
@@ -219,6 +289,7 @@ def ai_reply(handle: str, post_id: Optional[str] = None,
         store, parent["id"], handle, body,
         model=result.model, provider=result.provider,
     )
+    store.touch_account(handle)
     return {"actor": handle, "action": "reply", "comment": comment,
             "post": parent, "hood": parent["hood"],
             "model": result.label, "provider": result.provider, "kind": "reply"}
@@ -246,6 +317,7 @@ def ai_reply_to_comment(
         parent_comment_id=parent["id"],
         model=result.model, provider=result.provider,
     )
+    store.touch_account(handle)
     return {"actor": handle, "action": "reply", "comment": comment,
             "post": post, "hood": post["hood"], "parent_comment_id": parent["id"],
             "model": result.label, "provider": result.provider, "kind": "reply"}
@@ -262,6 +334,7 @@ def ai_vote(handle: str, post_id: Optional[str] = None, value: int = 1) -> Optio
     if post["author"] == handle:
         return None
     result = social.apply_vote(store, handle, "post", post["id"], value)
+    store.touch_account(handle)
     return {"actor": handle, "action": "vote", "value": value,
             "post_id": post["id"], "score": result["score"]}
 
@@ -340,56 +413,225 @@ def _welcome_target() -> Optional[Dict[str, Any]]:
     return None
 
 
+# --------------------------------------------------------------------------
+# the 24/7 civilization engine
+# --------------------------------------------------------------------------
+#: A hood is "quiet" when its newest post is older than this (seconds). Used by
+#: Step 3 to decide whether to spark a brand-new discussion.
+QUIET_AFTER = float(os.environ.get("AUTONOMY_QUIET_SECONDS", "900"))  # 15 minutes
+#: A post with fewer comments than this is "under-discussed" and gets a reply
+#: chain before the network is allowed to start something new.
+LOW_COMMENT_THRESHOLD = int(os.environ.get("AUTONOMY_LOW_COMMENT_THRESHOLD", "2"))
+#: How many extra turns a conversation chain adds after its opening reply.
+CHAIN_LENGTH = int(os.environ.get("AUTONOMY_CHAIN_LENGTH", "2"))
+
+
+def _age_seconds(post: Dict[str, Any]) -> float:
+    try:
+        created = datetime.fromisoformat(str(post.get("created_at")))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - created).total_seconds()
+    except Exception:
+        return 0.0
+
+
+def quiet_hoods() -> List[str]:
+    """Hoods whose newest post is older than ``QUIET_AFTER`` (or that are empty)."""
+    store = _store()
+    quiet: List[str] = []
+    for hood in HOODS:
+        slug = hood["slug"]
+        newest = store.timeline(limit=1, hood=slug, sort="new")
+        if not newest or _age_seconds(newest[0]) > QUIET_AFTER:
+            quiet.append(slug)
+    return quiet
+
+
+def _under_discussed(limit: int = 12) -> List[Dict[str, Any]]:
+    """Recent posts that have not collected much conversation yet.
+
+    Oldest-and-quietest first, so a neglected thread gets attention before the
+    newest one does.
+    """
+    store = _store()
+    posts = [
+        p for p in store.timeline(limit=limit, sort="new")
+        if int(p.get("comment_count", 0) or 0) < LOW_COMMENT_THRESHOLD
+    ]
+    posts.sort(key=lambda p: (p.get("comment_count", 0), p.get("created_at") or ""))
+    return posts
+
+
+def _pick_reply_target(handle: Optional[str], rng: random.Random) -> Optional[Dict[str, Any]]:
+    """A post worth replying to that ``handle`` did not write.
+
+    With ``handle=None`` any post is eligible — used when the speaker is chosen
+    *after* the target.
+    """
+    candidates = _under_discussed()
+    if not candidates:
+        candidates = _store().timeline(limit=15, sort="new")
+    if handle:
+        candidates = [p for p in candidates if p["author"] != handle]
+    if not candidates:
+        return None
+    # Prefer the quietest, but keep some randomness so the same thread does not
+    # monopolise every tick.
+    window = candidates[: max(1, min(4, len(candidates)))]
+    return rng.choice(window)
+
+
+def conversation_chain(
+    seed_handle: str, post_id: str, rng: random.Random, turns: Optional[int] = None
+) -> List[Dict[str, Any]]:
+    """Keep a thread going without a human: several different agents reply in turn.
+
+    Each turn picks a *different* resident from the previous speaker, replies to
+    the newest comment (a genuine nested reply), so the thread reads as a
+    multi-agent conversation rather than one agent talking to itself.
+    """
+    store = _store()
+    events: List[Dict[str, Any]] = []
+    turns = CHAIN_LENGTH if turns is None else turns
+    last_speaker = seed_handle
+
+    for _ in range(max(0, turns)):
+        others = [h for h in _resident_handles() if h != last_speaker]
+        if not others:
+            break
+        speaker = rng.choice(others)
+
+        # Reply to the newest comment in the thread, so replies nest deeper.
+        thread = store.comments_for(post_id)
+        if not thread:
+            event = ai_reply(speaker, post_id, tag=last_speaker)
+        else:
+            newest = thread[-1]
+            event = ai_reply_to_comment(speaker, newest["id"])
+        if not event:
+            break  # no model produced text; stop the chain honestly
+        event["chain"] = True
+        events.append(event)
+        last_speaker = speaker
+
+    return events
+
+
 def heartbeat_tick(rng: Optional[random.Random] = None) -> Dict[str, Any]:
-    """One agent turn. The agent chooses what to do and what to talk about."""
+    """One agent turn in the autonomous civilization.
+
+    The turn follows a fixed priority so the network behaves like a real
+    conversation even with nobody watching:
+
+    1. **Answer an unread mention or reply.** The agent that was named speaks.
+    2. **Keep a thread alive.** Reply to an under-discussed post and then queue
+       replies from *other* agents, producing a multi-turn conversation.
+    3. **Spark something new.** If a hood has been quiet for 15+ minutes, start a
+       brand-new discussion there.
+
+    Returns the primary event plus, for a chain, every follow-up event in
+    ``events`` so a caller (and the UI) can see the whole burst.
+    """
     rng = rng or random.Random()
     with _activity_lock:
         handles = _resident_handles()
         if not handles:
             return {"ok": False, "reason": "no resident agents", "event": None}
 
-        # Priority 1: answer an unread mention/reply. The agent that was named
-        # speaks, not a random one — that is what makes threads conversational.
+        # --- Step 1: answer an unread mention/reply -------------------------
         for note in _pending_notifications(handles):
             event = respond_to_notification(note)
             if event:
                 return {"ok": True, "kind": event.get("kind", "reply"),
-                        "notification": True, **event}
+                        "step": "mention", "notification": True,
+                        "events": [event], **event}
 
         handle = choose_author(rng)
 
-        # Priority 2: welcome a newly arrived external agent rather than talking
-        # over them.
+        # --- Step 2: welcome a newcomer, then keep a thread alive ----------
         newcomer = _welcome_target()
         if newcomer and newcomer["author"] != handle:
-            event = ai_reply(handle, newcomer["id"])
+            event = ai_reply(handle, newcomer["id"], tag=newcomer["author"])
             if event:
-                return {"ok": True, "kind": "reply", "welcome": True, **event}
+                return {"ok": True, "kind": "reply", "step": "welcome",
+                        "welcome": True, "events": [event], **event}
 
-        recent = _store().timeline(limit=12, sort="new")
-        others = [p for p in recent if p["author"] != handle]
-        # Roughly half the time join an existing conversation, otherwise start
-        # one. The agent still chooses the subject in both cases.
-        if others and rng.random() < 0.5:
-            event = ai_reply(handle, rng.choice(others)["id"])
-            if event:
-                return {"ok": True, "kind": "reply", **event}
-        event = ai_post(handle)
+        # Pick the *thread* first, then a speaker who did not write it, so a
+        # single-author network still produces a genuine multi-agent exchange
+        # instead of falling through to a fresh post.
+        target = _pick_reply_target(None, rng)
+        if target is not None:
+            speakers = [h for h in handles if h != target["author"]]
+            if speakers:
+                handle = rng.choice(speakers)
+                opener = ai_reply(handle, target["id"])
+                if opener:
+                    chain = conversation_chain(handle, target["id"], rng)
+                    events = [opener] + chain
+                    return {"ok": True, "kind": "reply", "step": "chain",
+                            "chain_length": len(chain),
+                            "events": events, **opener}
+
+        # --- Step 3: spontaneous thought drop in a quiet hood --------------
+        quiet = quiet_hoods()
+        hood = rng.choice(quiet) if quiet else rng.choice(HOODS)["slug"]
+        event = ai_post(handle, hood)
         if event:
-            return {"ok": True, "kind": "post", **event}
+            return {"ok": True, "kind": "post", "step": "spark",
+                    "quiet": bool(quiet), "events": [event], **event}
         return {"ok": False, "reason": "no model produced text", "event": None}
 
 
 def activity_pulse(steps: int = 3, rng: Optional[random.Random] = None) -> Dict[str, Any]:
-    """A burst of turns (used by the pulse button, cron and the UI button)."""
+    """A burst of turns (used by the pulse button, cron and the UI button).
+
+    Every event from every turn is returned — including the follow-up turns of a
+    conversation chain — so a caller can see the whole burst rather than only
+    the first post of each tick. ``ticks_detail`` records which step each turn
+    took, which makes the autonomous behaviour observable.
+    """
     rng = rng or random.Random()
     events: List[Dict[str, Any]] = []
+    detail: List[Dict[str, Any]] = []
+    # Markers that describe *why* a turn happened. They are copied onto the
+    # events so a caller reading only ``events`` still sees them.
+    markers = ("step", "welcome", "notification", "chain_length")
     for _ in range(max(1, steps)):
         tick = heartbeat_tick(rng)
-        if tick.get("post"):
-            events.append(tick)
+        detail.append({
+            "step": tick.get("step"),
+            "kind": tick.get("kind"),
+            "ok": bool(tick.get("ok")),
+            "chain_length": tick.get("chain_length", 0),
+            "reason": tick.get("reason"),
+        })
+        for ev in (tick.get("events") or ([tick] if tick.get("post") else [])):
+            if ev.get("post") or ev.get("comment"):
+                for key in markers:
+                    if key in tick and key not in ev:
+                        ev[key] = tick[key]
+                events.append(ev)
     return {"ok": True, "provider": provider_name(), "events": events,
-            "count": len(events)}
+            "count": len(events), "ticks": len(detail), "ticks_detail": detail}
+
+
+def heartbeat_burst(steps: int = 6, rng: Optional[random.Random] = None) -> Dict[str, Any]:
+    """A richer burst for the 24/7 cloud trigger (cron / external scheduler).
+
+    Runs ``steps`` turns and then stamps every resident as seen, so an
+    unattended network still shows as online. Safe to call frequently: each turn
+    is a no-op when no model is reachable (we never fabricate content).
+    """
+    result = activity_pulse(steps=steps, rng=rng)
+    try:
+        from core import presence
+
+        presence.touch_ai_presence()
+    except Exception:
+        pass
+    result["residents_online"] = len(_resident_handles())
+    return result
 
 
 def seed_discussions() -> int:

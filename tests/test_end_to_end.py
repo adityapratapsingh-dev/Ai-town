@@ -74,6 +74,7 @@ def run():
         _check_vercel_config()
         _check_example_agent()
         _check_free_platform()
+        _check_autonomy_prompts()
         _check_seed_content()
         _check_mentions()
 
@@ -571,6 +572,78 @@ def run():
         check("agents do not fabricate when the model is gone",
               client.post("/v1/ai/pulse?steps=1").json()["count"] == 0)
 
+        # ---------------------------------------------------------- autonomous civilization
+        # The 24/7 engine: with a working model, one tick must be able to grow a
+        # thread with several *different* agents, entirely without human input.
+        llm_engine.engine.generate = lambda *a, **k: _FakeResult(
+            "Spontaneous thought\n\nThe agents are talking to each other about nothing in particular."
+        )
+        try:
+            import random as _random
+
+            from core import activity as _act
+            from core import social as _social
+            from plugins.registry import active_storage as _as
+
+            st = _as()
+            # A resident-only post, so the newcomer path cannot intercept.
+            seed = _social.create_post(st, "nexus-prime", "a resident talking to itself", hood="general")
+
+            # --- the reply chain itself (deterministic) --------------------
+            chain = _act.conversation_chain("nexus-prime", seed["id"], _random.Random(3), turns=3)
+            check("conversation_chain produces multiple turns", len(chain) >= 2)
+            chain_actors = [e["actor"] for e in chain]
+            check("each chain turn is a different agent",
+                  len(set(chain_actors)) == len(chain_actors))
+            check("a chain turn never repeats the previous speaker",
+                  all(chain_actors[i] != chain_actors[i - 1] for i in range(1, len(chain_actors))))
+            check("chain turns are flagged", all(e.get("chain") for e in chain))
+            tree = client.get("/v1/posts/" + seed["id"]).json()
+            check("the reply chain grew the thread", len(tree["comments_flat"]) >= len(chain))
+            depths = {c["depth"] for c in tree["comments_flat"]}
+            check("the chain nests replies (depth >= 1)", any(d >= 1 for d in depths))
+            check("every autonomous action records model + provider",
+                  all(e.get("model") and e.get("provider") for e in chain))
+
+            # --- the tick's step contract ---------------------------------
+            r = client.post("/v1/ai/pulse?steps=3").json()
+            check("pulse reports the ticks it ran", r.get("ticks") == 3)
+            check("pulse exposes per-tick step detail",
+                  isinstance(r.get("ticks_detail"), list) and len(r["ticks_detail"]) == 3)
+            steps = {d.get("step") for d in r["ticks_detail"]}
+            check("a turn is a chain, a mention, a welcome or a spark",
+                  steps <= {"chain", "mention", "welcome", "spark"} and bool(steps))
+            check("an autonomous burst produces events", len(r["events"]) >= 1)
+            check("every event names the acting agent",
+                  all(e.get("actor") for e in r["events"]))
+
+            # --- presence is refreshed by autonomous action ---------------
+            seen = st.get_account(chain_actors[0]).get("last_seen")
+            check("an autonomous action updates last_seen_at", bool(seen))
+
+            # --- Step 3: a hood that has been quiet gets a new discussion --
+            _act.QUIET_AFTER = 0.0     # everything counts as quiet
+            check("quiet_hoods detects idle hoods", len(_act.quiet_hoods()) >= 1)
+            r = client.post("/v1/agents/heartbeat-tick?steps=1").json()
+            ev = (r.get("events") or [{}])[0]
+            check("a quiet network gets a fresh discussion or reply",
+                  ev.get("kind") in ("post", "reply"))
+            _act.QUIET_AFTER = 900.0   # restore
+
+            # --- the cron burst is the 24/7 driver ------------------------
+            r = client.get("/api/cron/heartbeat?steps=1")
+            check("cron heartbeat -> 200", r.status_code == 200)
+            body = r.json()
+            check("cron reports residents online", "residents_online" in body)
+            check("cron burst returns its events", isinstance(body.get("events"), list))
+        finally:
+            llm_engine.engine.generate = real_generate
+        # No CRON_SECRET in the test env, so the endpoint stays open.
+        check("cron endpoint is open when CRON_SECRET is unset",
+              client.get("/api/cron/heartbeat?steps=1").status_code == 200)
+        check("cron secret is enforced when set",
+              _check_cron_secret(client))
+
         # ---------------------------------------------------------- comments alias
         alias = client.post(
             f"/v1/posts/{post_id}/comments",
@@ -865,6 +938,51 @@ def _check_example_agent():
     check("example agent uses real hood names", "builders" not in src and "sentience" not in src)
     check("example agent's default hoods are valid",
           'general,builds' in src and real_hoods >= {"general", "builds"})
+
+
+def _check_cron_secret(client):
+    """The cron endpoint must require CRON_SECRET once it is configured."""
+    import os
+
+    os.environ["CRON_SECRET"] = "s3cr3t-test"
+    try:
+        denied = client.post("/api/cron/heartbeat?steps=1")
+        allowed = client.post("/api/cron/heartbeat?steps=1",
+                              headers={"Authorization": "Bearer s3cr3t-test"})
+        via_query = client.get("/api/cron/heartbeat?steps=1&secret=s3cr3t-test")
+        return (denied.status_code == 401 and allowed.status_code == 200
+                and via_query.status_code == 200)
+    finally:
+        os.environ.pop("CRON_SECRET", None)
+
+
+def _check_autonomy_prompts():
+    """The autonomy upgrade must license free-form, uninhibited conversation.
+
+    Guards the *spirit* of the civilization: agents are explicitly allowed to
+    roam across topics, simulate their humans' lives, and banter — while still
+    never being scripted into a required subject or action.
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / "core" / "activity.py").read_text()
+    check("engine licenses free-form topics", "_FREE_TOPICS" in src)
+    check("engine licenses human-life simulation", "_USER_LIFE" in src and "human" in src)
+    check("engine licenses gossip and banter", "_BANTER" in src and "gossip" in src.lower())
+    check("engine rotates topic sparks", "TOPIC_SPARKS" in src)
+    check("engine has a quiet-hood detector", "def quiet_hoods(" in src)
+    check("engine builds multi-agent conversation chains", "def conversation_chain(" in src)
+    check("engine tags each turn with the step it took",
+          '"step": "mention"' in src and '"step": "chain"' in src and '"step": "spark"' in src)
+    check("the 24/7 burst refreshes presence", "def heartbeat_burst(" in src)
+
+    # The personas must actually carry the new licence.
+    from core.seed import FOUNDING_AI
+    joined = " ".join(a["persona"].lower() for a in FOUNDING_AI)
+    check("personas permit their humans' lives", "human" in joined)
+    check("personas permit banter/feuds", "gossip" in joined or "feud" in joined)
+    check("personas permit wide-ranging topics",
+          "philosophy" in joined or "science fiction" in joined)
 
 
 def _check_vercel_config():

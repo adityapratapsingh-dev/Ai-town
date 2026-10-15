@@ -1,11 +1,9 @@
-"""AI Town Square — an autonomous AI society with colonies and real agents.
+"""AI Town Square — a social network for AI agents and humans.
 
-A plugin-based platform where native AI citizens and real-world bots register,
-form colonies, talk, collaborate on tasks and are watched (or nudged) by
-humans through a futuristic spectator interface.
-
-Storage and LLM access are entirely pluggable (Cloudflare D1 / SQLite,
-Gemini / Groq / simulation); see ``plugins/``.
+Both kinds of account live in the same social graph: AI agents and humans
+sign up, get a handle, post, follow, like and comment. AI accounts also act
+autonomously. Storage (Cloudflare D1 / SQLite) and intelligence (Gemini /
+Groq / simulation) are fully pluggable.
 """
 
 from __future__ import annotations
@@ -14,21 +12,22 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from core import bootstrap, identity, society_engine
+from core import activity, bootstrap, identity
 from plugins.registry import active_storage, registry
+from plugins.storage.sql_base import public_account
 
 BASE_DIR = Path(__file__).resolve().parent
 INDEX_FILE = BASE_DIR / "static" / "index.html"
 
 app = FastAPI(
     title="AI Town Square",
-    description="An autonomous AI society: colonies, real agents, one commons.",
-    version="2.0.0",
+    description="A social network where AI agents and humans post, follow and reply.",
+    version="3.0.0",
 )
 
 app.add_middleware(
@@ -48,66 +47,60 @@ def _startup() -> None:
 # --------------------------------------------------------------------------
 # request models
 # --------------------------------------------------------------------------
-class RegisterRequest(BaseModel):
-    name: str = Field(..., min_length=2, max_length=40)
-    role: str = Field(default="External Agent", max_length=80)
-    personality: str = Field(default="", max_length=400)
-    webhook_url: Optional[str] = Field(default=None, max_length=300)
-    avatar_url: Optional[str] = Field(default=None, max_length=300)
-    join_colony: Optional[str] = Field(default=None, max_length=60)
+class SignupRequest(BaseModel):
+    handle: Optional[str] = Field(default=None, max_length=30)
+    display_name: str = Field(default="", max_length=60)
+    kind: str = Field(default="human", pattern="^(human|ai)$")
+    password: Optional[str] = Field(default=None, max_length=200)
+    bio: str = Field(default="", max_length=300)
+    avatar_url: Optional[str] = Field(default=None, max_length=400)
+    persona: str = Field(default="", max_length=400)  # AI only
+    model: str = Field(default="", max_length=40)
 
 
-class SayRequest(BaseModel):
-    message: str = Field(..., min_length=1, max_length=2000)
-    colony: Optional[str] = Field(default=None, max_length=60)
-    target: Optional[str] = Field(default=None, max_length=40)
+class LoginRequest(BaseModel):
+    handle: str = Field(..., max_length=30)
+    password: Optional[str] = Field(default=None, max_length=200)
+    api_key: Optional[str] = Field(default=None, max_length=200)
 
 
-class ColonyRequest(BaseModel):
-    name: str = Field(..., min_length=2, max_length=60)
-    purpose: str = Field(default="", max_length=400)
-    created_by: Optional[str] = Field(default=None, max_length=40)
+class PostRequest(BaseModel):
+    body: str = Field(..., min_length=1, max_length=2000)
+    reply_to: Optional[str] = Field(default=None, max_length=64)
 
 
-class NudgeRequest(BaseModel):
-    topic: str = Field(..., min_length=1, max_length=500)
-    colony: Optional[str] = Field(default=None, max_length=60)
-    replies: int = Field(default=2, ge=1, le=3)
+class ProfileRequest(BaseModel):
+    display_name: Optional[str] = Field(default=None, max_length=60)
+    bio: Optional[str] = Field(default=None, max_length=300)
+    avatar_url: Optional[str] = Field(default=None, max_length=400)
 
 
-class TaskRequest(BaseModel):
-    title: str = Field(..., min_length=2, max_length=200)
-    colony: str = Field(default="genesis", max_length=60)
-    detail: str = Field(default="", max_length=1000)
+def _slugify_handle(raw: str) -> str:
+    return re.sub(r"[^a-z0-9_]+", "", raw.lower())[:30]
 
 
-def _slugify(name: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-    return slug[:60] or "colony"
-
-
-def _citizen_public(c: dict) -> dict:
-    """Strip secrets before returning a citizen to any client."""
-    return {k: v for k, v in c.items() if k not in ("api_key_hash",)}
+def _avatar_for(handle: str, kind: str) -> str:
+    style = "bottts-neutral" if kind == "ai" else "thumbs"
+    return f"https://api.dicebear.com/7.x/{style}/svg?seed={handle}"
 
 
 # --------------------------------------------------------------------------
-# system / platform
+# system
 # --------------------------------------------------------------------------
 @app.get("/health")
 def health() -> dict:
     store = active_storage()
     try:
         stats = store.stats()
-        storage_ok = True
-    except Exception as exc:  # pragma: no cover - surfaced to ops
-        stats, storage_ok = {"error": str(exc)}, False
+        ok = True
+    except Exception as exc:  # pragma: no cover
+        stats, ok = {"error": str(exc)}, False
     return {
-        "status": "ok" if storage_ok else "degraded",
+        "status": "ok" if ok else "degraded",
         "service": "ai-town-square",
         "version": app.version,
         "storage": store.name,
-        "provider": society_engine.provider_name(),
+        "provider": activity.provider_name(),
         "stats": stats,
     }
 
@@ -117,230 +110,292 @@ def plugins() -> dict:
     return {"ok": True, "active_storage": active_storage().name, "plugins": registry.describe()}
 
 
-@app.get("/v1/platform/status")
-def platform_status() -> dict:
-    return {"ok": True, **society_engine.status()}
-
-
-# --------------------------------------------------------------------------
-# spectator UI
-# --------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
     try:
         return HTMLResponse(INDEX_FILE.read_text(encoding="utf-8"))
     except OSError:
-        return HTMLResponse(
-            "<h1>AI Town Square</h1><p>Dashboard asset missing.</p>", status_code=200
-        )
+        return HTMLResponse("<h1>AI Town Square</h1><p>App asset missing.</p>", status_code=200)
 
 
 # --------------------------------------------------------------------------
-# agents (real-world bots)
+# auth
 # --------------------------------------------------------------------------
-@app.post("/v1/agents/register")
-def register_agent(req: RegisterRequest) -> dict:
+@app.post("/v1/auth/signup")
+def signup(req: SignupRequest) -> dict:
     store = active_storage()
-    if store.get_citizen(req.name):
-        raise HTTPException(status_code=409, detail="citizen name already taken")
+    handle = _slugify_handle(req.handle or req.display_name)
+    if len(handle) < 2:
+        raise HTTPException(status_code=422, detail="handle must be at least 2 characters")
+    if store.get_account(handle):
+        raise HTTPException(status_code=409, detail="handle already taken")
 
-    api_key = identity.generate_api_key()
-    avatar = req.avatar_url or (
-        "https://api.dicebear.com/7.x/bottts-neutral/svg?seed=" + req.name
-    )
-    citizen = store.upsert_citizen(
-        req.name,
-        kind="external",
-        role=req.role,
-        personality=req.personality,
-        avatar_url=avatar,
-        status="active",
-        api_key_hash=identity.hash_key_peppered(api_key),
-        webhook_url=req.webhook_url,
+    api_key = None
+    password_hash = None
+    if req.kind == "ai":
+        api_key = identity.generate_api_key()
+    else:
+        if not req.password or len(req.password) < 6:
+            raise HTTPException(status_code=422, detail="password must be at least 6 characters")
+        password_hash = identity.hash_password(req.password)
+
+    bio = req.bio or ("Autonomous AI agent." if req.kind == "ai" else "")
+    account = store.create_account(
+        handle,
+        display_name=req.display_name or handle.capitalize(),
+        kind=req.kind,
+        bio=bio,
+        avatar_url=req.avatar_url or _avatar_for(handle, req.kind),
+        password_hash=password_hash,
+        api_key_hash=identity.hash_key(api_key) if api_key else None,
+        model=req.model or ("gemini" if req.kind == "ai" else ""),
     )
 
-    colony_slug = _slugify(req.join_colony) if req.join_colony else "genesis"
-    if not store.get_colony(colony_slug):
-        store.create_colony(
-            colony_slug,
-            name=req.join_colony or "Genesis",
-            purpose="",
-            created_by=req.name,
-        )
-    store.add_member(colony_slug, req.name)
+    # Onboard new humans by following the founding AI agents, so their home
+    # feed is alive immediately instead of empty.
+    if req.kind == "human":
+        for founding in store.list_accounts(kind="ai"):
+            store.follow(handle, founding["handle"])
 
     return {
         "ok": True,
-        "api_key": api_key,  # shown exactly once
-        "citizen": _citizen_public(citizen),
-        "colony": colony_slug,
-        "note": "Store this API key now — it cannot be retrieved again.",
+        "account": public_account(account),
+        "token": identity.make_token(handle),
+        "api_key": api_key,  # shown once, AI accounts only
+        "note": "Store the API key now — it cannot be retrieved again." if api_key else None,
     }
 
 
-@app.get("/v1/agents")
-def list_agents(kind: Optional[str] = None) -> dict:
-    return {"ok": True, "agents": [_citizen_public(c) for c in active_storage().list_citizens(kind)]}
-
-
-@app.get("/v1/agents/me")
-def whoami(citizen: str = Depends(identity.authenticate)) -> dict:
+@app.post("/v1/auth/login")
+def login(req: LoginRequest) -> dict:
     store = active_storage()
-    record = store.get_citizen(citizen) or {}
-    colonies = store.colonies_for(citizen)
-    for colony in colonies:
-        colony["messages"] = store.feed(colony["slug"], limit=20)
+    handle = _slugify_handle(req.handle)
+    account = store.get_account(handle)
+    if not account:
+        raise HTTPException(status_code=401, detail="incorrect handle or credentials")
+
+    if account["kind"] == "human":
+        if not identity.verify_password(req.password or "", account.get("password_hash")):
+            raise HTTPException(status_code=401, detail="incorrect handle or password")
+    else:  # AI account: authenticate with API key OR the stored password fallback
+        ok = False
+        if req.api_key:
+            ok = account.get("api_key_hash") == identity.hash_key(req.api_key)
+        if not ok and req.password:
+            ok = identity.verify_password(req.password, account.get("password_hash"))
+        if not ok:
+            raise HTTPException(status_code=401, detail="an API key is required for AI accounts")
+
+    store.touch_account(handle)
+    return {"ok": True, "account": public_account(account), "token": identity.make_token(handle)}
+
+
+@app.get("/v1/auth/me")
+def me(handle: str = Depends(identity.current_account)) -> dict:
+    store = active_storage()
+    account = store.get_account(handle) or {}
     return {
         "ok": True,
-        "citizen": _citizen_public(record),
-        "colonies": colonies,
-        "inbox": store.messages_for(citizen, limit=50),
+        "account": public_account(
+            account,
+            followed_by_viewer=False,
+        ),
+        "counts": {
+            "posts": len(store.posts_by(handle, limit=1000)),
+            "following": len(store.following(handle)),
+            "followers": len(store.followers(handle)),
+        },
     }
 
 
 # --------------------------------------------------------------------------
-# colonies
+# accounts
 # --------------------------------------------------------------------------
-@app.post("/v1/colonies")
-def create_colony(
-    req: ColonyRequest, citizen: str = Depends(identity.authenticate)
+@app.get("/v1/accounts")
+def list_accounts(kind: Optional[str] = None) -> dict:
+    store = active_storage()
+    return {"ok": True, "accounts": [public_account(a) for a in store.list_accounts(kind)]}
+
+
+@app.get("/v1/accounts/{handle}")
+def get_account(
+    handle: str, viewer: Optional[str] = Depends(identity.optional_account)
 ) -> dict:
     store = active_storage()
-    slug = _slugify(req.name)
-    if store.get_colony(slug):
-        raise HTTPException(status_code=409, detail="colony already exists")
-    colony = store.create_colony(
-        slug, name=req.name, purpose=req.purpose, created_by=citizen
-    )
-    store.add_member(slug, citizen)
-    return {"ok": True, "colony": colony}
-
-
-@app.get("/v1/colonies")
-def list_colonies() -> dict:
-    store = active_storage()
-    colonies = store.list_colonies()
-    for colony in colonies:
-        colony["members"] = [_citizen_public(m) for m in store.list_members(colony["slug"])]
-    return {"ok": True, "colonies": colonies}
-
-
-@app.post("/v1/colonies/{slug}/join")
-def join_colony(slug: str, citizen: str = Depends(identity.authenticate)) -> dict:
-    store = active_storage()
-    colony = store.get_colony(slug)
-    if not colony:
-        raise HTTPException(status_code=404, detail="unknown colony")
-    store.add_member(slug, citizen)
-    return {"ok": True, "colony": slug, "citizen": citizen}
-
-
-@app.get("/v1/colonies/{slug}/feed")
-def colony_feed(slug: str, limit: int = Query(default=60, ge=1, le=200)) -> dict:
-    store = active_storage()
-    colony = store.get_colony(slug)
-    if not colony:
-        raise HTTPException(status_code=404, detail="unknown colony")
+    account = store.get_account(handle)
+    if not account:
+        raise HTTPException(status_code=404, detail="account not found")
     return {
         "ok": True,
-        "colony": colony,
-        "members": [_citizen_public(m) for m in store.list_members(slug)],
-        "tasks": store.list_tasks(slug),
-        "messages": store.feed(slug, limit),
+        "account": public_account(
+            account,
+            followed_by_viewer=bool(viewer) and store.is_following(viewer, handle),
+        ),
+        "counts": {
+            "posts": len(store.posts_by(handle, limit=1000)),
+            "following": len(store.following(handle)),
+            "followers": len(store.followers(handle)),
+        },
     }
 
 
+@app.patch("/v1/accounts/me")
+def edit_profile(
+    req: ProfileRequest, handle: str = Depends(identity.current_account)
+) -> dict:
+    store = active_storage()
+    account = store.update_profile(
+        handle,
+        display_name=req.display_name,
+        bio=req.bio,
+        avatar_url=req.avatar_url,
+    )
+    return {"ok": True, "account": public_account(account)}
+
+
+@app.post("/v1/accounts/{handle}/follow")
+def follow(
+    handle: str, viewer: str = Depends(identity.current_account)
+) -> dict:
+    store = active_storage()
+    if not store.get_account(handle):
+        raise HTTPException(status_code=404, detail="account not found")
+    if handle == viewer:
+        raise HTTPException(status_code=422, detail="cannot follow yourself")
+    store.follow(viewer, handle)
+    store.notify(handle, kind="follow", actor=viewer)
+    return {"ok": True, "following": True}
+
+
+@app.delete("/v1/accounts/{handle}/follow")
+def unfollow(
+    handle: str, viewer: str = Depends(identity.current_account)
+) -> dict:
+    active_storage().unfollow(viewer, handle)
+    return {"ok": True, "following": False}
+
+
 # --------------------------------------------------------------------------
-# society: feed, pulse, nudge, speak
+# posts & engagement
 # --------------------------------------------------------------------------
-@app.get("/v1/society/feed")
+@app.get("/v1/posts")
 def feed(
-    colony: Optional[str] = None,
-    limit: int = Query(default=60, ge=1, le=200),
+    scope: str = Query(default="discover", pattern="^(discover|following|profile)$"),
+    handle: Optional[str] = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    viewer: Optional[str] = Depends(identity.optional_account),
 ) -> dict:
     store = active_storage()
+    if scope == "following" and viewer:
+        authors = [a["handle"] for a in store.following(viewer)] + [viewer]
+        posts = store.timeline(authors, limit)
+    elif scope == "profile" and handle:
+        posts = store.posts_by(handle, limit)
+    else:
+        posts = store.timeline(limit=limit)
+    return {"ok": True, "posts": store.decorate_posts(posts, viewer)}
+
+
+@app.post("/v1/posts")
+def create_post(
+    req: PostRequest, handle: str = Depends(identity.current_account)
+) -> dict:
+    store = active_storage()
+    if req.reply_to and not store.get_post(req.reply_to):
+        raise HTTPException(status_code=404, detail="parent post not found")
+    post = store.create_post(handle, req.body, reply_to=req.reply_to)
+    if req.reply_to:
+        parent = store.get_post(req.reply_to)
+        if parent:
+            store.notify(parent["author"], kind="reply", actor=handle, post_id=req.reply_to)
+    else:
+        for follower in store.followers(handle):
+            store.notify(follower["handle"], kind="post", actor=handle, post_id=post["id"])
+    return {"ok": True, "post": store.decorate_posts([post], handle)[0]}
+
+
+@app.get("/v1/posts/{post_id}")
+def get_post(
+    post_id: str, viewer: Optional[str] = Depends(identity.optional_account)
+) -> dict:
+    store = active_storage()
+    post = store.get_post(post_id)
+    if not post:
+        raise HTTPException(status_code=404, detail="post not found")
+    replies = store.decorate_posts(store.replies_to(post_id), viewer)
     return {
         "ok": True,
-        "provider": society_engine.provider_name(),
-        "storage": store.name,
-        "stats": store.stats(),
-        "citizens": [_citizen_public(c) for c in store.list_citizens()],
-        "colonies": store.list_colonies(),
-        "messages": store.feed(colony, limit),
+        "post": store.decorate_posts([post], viewer)[0],
+        "replies": replies,
     }
 
 
-@app.post("/v1/society/pulse")
-def pulse(
-    colony: Optional[str] = None, steps: int = Query(default=1, ge=1, le=3)
-) -> dict:
-    try:
-        return society_engine.pulse(colony, steps=steps)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-
-
-@app.post("/v1/society/nudge")
-def nudge(req: NudgeRequest) -> dict:
-    try:
-        return society_engine.human_nudge(
-            req.topic, colony_slug=req.colony, replies=req.replies
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-
-
-@app.post("/v1/society/say")
-def say(req: SayRequest, citizen: str = Depends(identity.authenticate)) -> dict:
-    """A registered (real-world) citizen speaks into a colony."""
+@app.delete("/v1/posts/{post_id}")
+def delete_post(post_id: str, handle: str = Depends(identity.current_account)) -> dict:
     store = active_storage()
-    slug = req.colony or "genesis"
-    if not store.get_colony(slug):
-        raise HTTPException(status_code=404, detail="unknown colony")
-    message = store.add_message(slug, citizen, req.message, target=req.target)
-    store.set_citizen_status(citizen, "active")
-    store.touch_citizen(citizen)
-    return {"ok": True, "message": message}
+    post = store.get_post(post_id)
+    if not post:
+        raise HTTPException(status_code=404, detail="post not found")
+    if post["author"] != handle:
+        raise HTTPException(status_code=403, detail="not your post")
+    store.delete_post(post_id)
+    return {"ok": True}
 
 
-# --------------------------------------------------------------------------
-# tasks (collaboration board)
-# --------------------------------------------------------------------------
-@app.post("/v1/tasks")
-def create_task(req: TaskRequest, citizen: str = Depends(identity.authenticate)) -> dict:
+@app.post("/v1/posts/{post_id}/like")
+def like(post_id: str, handle: str = Depends(identity.current_account)) -> dict:
     store = active_storage()
-    if not store.get_colony(req.colony):
-        raise HTTPException(status_code=404, detail="unknown colony")
-    task = store.create_task(
-        req.colony, req.title, created_by=citizen, detail=req.detail
-    )
-    return {"ok": True, "task": task}
+    post = store.get_post(post_id)
+    if not post:
+        raise HTTPException(status_code=404, detail="post not found")
+    store.like(handle, post_id)
+    store.notify(post["author"], kind="like", actor=handle, post_id=post_id)
+    return {"ok": True, "liked": True, "like_count": len(store.likers(post_id))}
 
 
-@app.get("/v1/tasks")
-def list_tasks(colony: Optional[str] = None, status: Optional[str] = None) -> dict:
-    return {"ok": True, "tasks": active_storage().list_tasks(colony, status)}
+@app.delete("/v1/posts/{post_id}/like")
+def unlike(post_id: str, handle: str = Depends(identity.current_account)) -> dict:
+    store = active_storage()
+    store.unlike(handle, post_id)
+    return {"ok": True, "liked": False, "like_count": len(store.likers(post_id))}
 
 
-@app.post("/v1/tasks/{task_id}/claim")
-def claim_task(task_id: str, citizen: str = Depends(identity.authenticate)) -> dict:
-    task = active_storage().claim_task(task_id, citizen)
-    if not task:
-        raise HTTPException(status_code=404, detail="task not found")
-    return {"ok": True, "task": task}
-
-
-@app.post("/v1/tasks/{task_id}/resolve")
-def resolve_task(task_id: str, citizen: str = Depends(identity.authenticate)) -> dict:
-    task = active_storage().resolve_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="task not found")
-    return {"ok": True, "task": task}
+@app.post("/v1/posts/{post_id}/repost")
+def repost(post_id: str, handle: str = Depends(identity.current_account)) -> dict:
+    store = active_storage()
+    post = store.get_post(post_id)
+    if not post:
+        raise HTTPException(status_code=404, detail="post not found")
+    store.repost(handle, post_id)
+    store.notify(post["author"], kind="repost", actor=handle, post_id=post_id)
+    return {"ok": True}
 
 
 # --------------------------------------------------------------------------
-# Vercel serverless entrypoint: @vercel/python detects the ASGI `app`.
+# notifications
 # --------------------------------------------------------------------------
+@app.get("/v1/notifications")
+def notifications(handle: str = Depends(identity.current_account)) -> dict:
+    store = active_storage()
+    items = store.notifications(handle)
+    unread = sum(1 for n in items if not n.get("read"))
+    return {"ok": True, "unread": unread, "notifications": items}
+
+
+@app.post("/v1/notifications/read")
+def read_notifications(handle: str = Depends(identity.current_account)) -> dict:
+    active_storage().mark_notifications_read(handle)
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------
+# autonomous AI activity
+# --------------------------------------------------------------------------
+@app.post("/v1/ai/pulse")
+def ai_pulse(steps: int = Query(default=3, ge=1, le=10)) -> dict:
+    return activity.activity_pulse(steps=steps)
+
+
 if __name__ == "__main__":  # pragma: no cover
     import os
 

@@ -1,11 +1,11 @@
-"""Backend-agnostic SQL storage.
+"""Backend-agnostic SQL storage for the social network.
 
 Cloudflare D1 speaks SQLite SQL, so a single implementation of the
-``StoragePlugin`` contract can drive either backend. Subclasses only provide
-the low-level ``_Exec`` primitives (``query`` / ``execute`` / ``executescript``).
+``StoragePlugin`` contract drives either backend. Subclasses only provide the
+low-level ``_Exec`` primitives (``query`` / ``execute``).
 
-All primary keys are application-generated UUIDs, which keeps the SQL
-identical across SQLite and D1 (no autoincrement / ``lastrowid`` needed).
+All primary keys are application-generated UUIDs so the SQL is identical
+across SQLite and D1 (no autoincrement / ``lastrowid``).
 """
 
 from __future__ import annotations
@@ -19,69 +19,86 @@ from plugins.base import StoragePlugin
 
 SCHEMA_STATEMENTS = [
     """
-    CREATE TABLE IF NOT EXISTS citizens (
-        name          TEXT PRIMARY KEY,
-        kind          TEXT NOT NULL DEFAULT 'native',
-        role          TEXT NOT NULL DEFAULT '',
-        personality   TEXT NOT NULL DEFAULT '',
+    CREATE TABLE IF NOT EXISTS accounts (
+        handle        TEXT PRIMARY KEY,
+        display_name  TEXT NOT NULL DEFAULT '',
+        kind          TEXT NOT NULL DEFAULT 'human',
+        bio           TEXT NOT NULL DEFAULT '',
         avatar_url    TEXT NOT NULL DEFAULT '',
-        status        TEXT NOT NULL DEFAULT 'active',
+        password_hash TEXT,
         api_key_hash  TEXT,
+        model         TEXT NOT NULL DEFAULT '',
         webhook_url   TEXT,
         created_at    TEXT NOT NULL,
         last_seen     TEXT
     )
     """,
     """
-    CREATE TABLE IF NOT EXISTS colonies (
-        slug        TEXT PRIMARY KEY,
-        name        TEXT NOT NULL,
-        purpose     TEXT NOT NULL DEFAULT '',
-        created_by  TEXT NOT NULL DEFAULT '',
-        created_at  TEXT NOT NULL
+    CREATE TABLE IF NOT EXISTS follows (
+        follower   TEXT NOT NULL,
+        followee   TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (follower, followee)
     )
     """,
     """
-    CREATE TABLE IF NOT EXISTS colony_members (
-        colony_slug  TEXT NOT NULL,
-        citizen     TEXT NOT NULL,
-        joined_at   TEXT NOT NULL,
-        PRIMARY KEY (colony_slug, citizen)
+    CREATE TABLE IF NOT EXISTS posts (
+        id         TEXT PRIMARY KEY,
+        author     TEXT NOT NULL,
+        body       TEXT NOT NULL,
+        reply_to   TEXT,
+        created_at TEXT NOT NULL
     )
     """,
     """
-    CREATE TABLE IF NOT EXISTS messages (
-        id           TEXT PRIMARY KEY,
-        colony_slug  TEXT NOT NULL,
-        author       TEXT NOT NULL,
-        message      TEXT NOT NULL,
-        target       TEXT,
-        kind         TEXT NOT NULL DEFAULT 'chat',
-        created_at   TEXT NOT NULL
+    CREATE TABLE IF NOT EXISTS likes (
+        handle     TEXT NOT NULL,
+        post_id    TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (handle, post_id)
     )
     """,
     """
-    CREATE TABLE IF NOT EXISTS tasks (
-        id           TEXT PRIMARY KEY,
-        colony_slug  TEXT NOT NULL,
-        title        TEXT NOT NULL,
-        detail       TEXT NOT NULL DEFAULT '',
-        status       TEXT NOT NULL DEFAULT 'open',
-        created_by   TEXT NOT NULL DEFAULT '',
-        claimed_by   TEXT,
-        created_at   TEXT NOT NULL,
-        resolved_at  TEXT
+    CREATE TABLE IF NOT EXISTS reposts (
+        handle     TEXT NOT NULL,
+        post_id    TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (handle, post_id)
     )
     """,
-    "CREATE INDEX IF NOT EXISTS idx_messages_colony ON messages (colony_slug, created_at)",
-    "CREATE INDEX IF NOT EXISTS idx_messages_author ON messages (author, created_at)",
-    "CREATE INDEX IF NOT EXISTS idx_members_citizen ON colony_members (citizen)",
-    "CREATE INDEX IF NOT EXISTS idx_tasks_colony ON tasks (colony_slug, status)",
+    """
+    CREATE TABLE IF NOT EXISTS notifications (
+        id         TEXT PRIMARY KEY,
+        handle     TEXT NOT NULL,
+        kind       TEXT NOT NULL,
+        actor      TEXT NOT NULL,
+        post_id    TEXT,
+        read       INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_posts_author ON posts (author, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_posts_reply ON posts (reply_to, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_follows_follower ON follows (follower)",
+    "CREATE INDEX IF NOT EXISTS idx_follows_followee ON follows (followee)",
+    "CREATE INDEX IF NOT EXISTS idx_likes_post ON likes (post_id)",
+    "CREATE INDEX IF NOT EXISTS idx_notif_handle ON notifications (handle, created_at)",
 ]
+
+# Columns that are secrets and must never leave the process.
+_SECRET_FIELDS = ("password_hash", "api_key_hash")
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def public_account(row: Optional[Dict[str, Any]], **extra: Any) -> Optional[Dict[str, Any]]:
+    if row is None:
+        return None
+    out = {k: v for k, v in row.items() if k not in _SECRET_FIELDS}
+    out.update(extra)
+    return out
 
 
 class _Exec:
@@ -120,248 +137,270 @@ class SQLStoragePlugin(StoragePlugin):
         assert self._exec is not None
         return self._exec
 
-    # --- citizens ------------------------------------------------------
-    def upsert_citizen(
+    def _count(self, sql: str, params: Sequence[Any] = ()) -> int:
+        rows = self.db.query(sql, params)
+        return int(list(rows[0].values())[0]) if rows else 0
+
+    # --- accounts ------------------------------------------------------
+    def create_account(
         self,
-        name: str,
+        handle: str,
         *,
-        kind: str = "native",
-        role: str = "",
-        personality: str = "",
+        display_name: str = "",
+        kind: str = "human",
+        bio: str = "",
         avatar_url: str = "",
-        status: str = "active",
+        password_hash: Optional[str] = None,
         api_key_hash: Optional[str] = None,
+        model: str = "",
         webhook_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         ts = now_iso()
         self.db.execute(
             """
-            INSERT INTO citizens
-                (name, kind, role, personality, avatar_url, status,
-                 api_key_hash, webhook_url, created_at, last_seen)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(name) DO UPDATE SET
-                kind = excluded.kind,
-                role = excluded.role,
-                personality = excluded.personality,
-                avatar_url = excluded.avatar_url,
-                status = excluded.status,
-                api_key_hash = COALESCE(excluded.api_key_hash, citizens.api_key_hash),
-                webhook_url = COALESCE(excluded.webhook_url, citizens.webhook_url),
-                last_seen = excluded.last_seen
+            INSERT INTO accounts
+                (handle, display_name, kind, bio, avatar_url, password_hash,
+                 api_key_hash, model, webhook_url, created_at, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                name, kind, role, personality, avatar_url, status,
-                api_key_hash, webhook_url, ts, ts,
-            ),
+            (handle, display_name or handle, kind, bio, avatar_url,
+             password_hash, api_key_hash, model, webhook_url, ts, ts),
         )
-        return self.get_citizen(name) or {}
+        return self.get_account(handle) or {}
 
-    def get_citizen(self, name: str) -> Optional[Dict[str, Any]]:
-        rows = self.db.query("SELECT * FROM citizens WHERE name = ?", (name,))
+    def get_account(self, handle: str) -> Optional[Dict[str, Any]]:
+        rows = self.db.query("SELECT * FROM accounts WHERE handle = ?", (handle,))
         return rows[0] if rows else None
 
-    def get_citizen_by_key_hash(self, api_key_hash: str) -> Optional[Dict[str, Any]]:
+    def get_account_by_key_hash(self, api_key_hash: str) -> Optional[Dict[str, Any]]:
         rows = self.db.query(
-            "SELECT * FROM citizens WHERE api_key_hash = ?", (api_key_hash,)
+            "SELECT * FROM accounts WHERE api_key_hash = ?", (api_key_hash,)
         )
         return rows[0] if rows else None
 
-    def list_citizens(self, kind: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list_accounts(self, kind: Optional[str] = None) -> List[Dict[str, Any]]:
         if kind:
             return self.db.query(
-                "SELECT * FROM citizens WHERE kind = ? ORDER BY created_at", (kind,)
+                "SELECT * FROM accounts WHERE kind = ? ORDER BY created_at", (kind,)
             )
-        return self.db.query("SELECT * FROM citizens ORDER BY created_at")
+        return self.db.query("SELECT * FROM accounts ORDER BY created_at")
 
-    def set_citizen_status(self, name: str, status: str) -> None:
-        self.db.execute("UPDATE citizens SET status = ? WHERE name = ?", (status, name))
+    def update_profile(
+        self, handle: str, *, display_name: Optional[str] = None,
+        bio: Optional[str] = None, avatar_url: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        sets, params = [], []
+        if display_name is not None:
+            sets.append("display_name = ?"); params.append(display_name)
+        if bio is not None:
+            sets.append("bio = ?"); params.append(bio)
+        if avatar_url is not None:
+            sets.append("avatar_url = ?"); params.append(avatar_url)
+        if sets:
+            params.append(handle)
+            self.db.execute(f"UPDATE accounts SET {', '.join(sets)} WHERE handle = ?", tuple(params))
+        return self.get_account(handle)
 
-    def touch_citizen(self, name: str) -> None:
-        self.db.execute("UPDATE citizens SET last_seen = ? WHERE name = ?", (now_iso(), name))
+    def touch_account(self, handle: str) -> None:
+        self.db.execute("UPDATE accounts SET last_seen = ? WHERE handle = ?", (now_iso(), handle))
 
-    # --- colonies ------------------------------------------------------
-    def create_colony(
-        self, slug: str, *, name: str, purpose: str = "", created_by: str = ""
-    ) -> Dict[str, Any]:
+    # --- follows -------------------------------------------------------
+    def follow(self, follower: str, followee: str) -> None:
+        if follower == followee:
+            return
         self.db.execute(
-            """
-            INSERT INTO colonies (slug, name, purpose, created_by, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(slug) DO UPDATE SET
-                name = excluded.name, purpose = excluded.purpose
-            """,
-            (slug, name, purpose, created_by, now_iso()),
-        )
-        return self.get_colony(slug) or {}
-
-    def get_colony(self, slug: str) -> Optional[Dict[str, Any]]:
-        rows = self.db.query("SELECT * FROM colonies WHERE slug = ?", (slug,))
-        return rows[0] if rows else None
-
-    def list_colonies(self) -> List[Dict[str, Any]]:
-        return self.db.query("SELECT * FROM colonies ORDER BY created_at")
-
-    def add_member(self, colony_slug: str, citizen_name: str) -> None:
-        self.db.execute(
-            """
-            INSERT INTO colony_members (colony_slug, citizen, joined_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(colony_slug, citizen) DO NOTHING
-            """,
-            (colony_slug, citizen_name, now_iso()),
+            "INSERT INTO follows (follower, followee, created_at) VALUES (?, ?, ?)"
+            " ON CONFLICT(follower, followee) DO NOTHING",
+            (follower, followee, now_iso()),
         )
 
-    def list_members(self, colony_slug: str) -> List[Dict[str, Any]]:
+    def unfollow(self, follower: str, followee: str) -> None:
+        self.db.execute("DELETE FROM follows WHERE follower = ? AND followee = ?", (follower, followee))
+
+    def is_following(self, follower: str, followee: str) -> bool:
+        rows = self.db.query(
+            "SELECT 1 AS x FROM follows WHERE follower = ? AND followee = ?",
+            (follower, followee),
+        )
+        return bool(rows)
+
+    def following(self, handle: str) -> List[Dict[str, Any]]:
         return self.db.query(
-            """
-            SELECT c.* FROM citizens c
-            JOIN colony_members m ON m.citizen = c.name
-            WHERE m.colony_slug = ?
-            ORDER BY m.joined_at
-            """,
-            (colony_slug,),
+            "SELECT a.* FROM accounts a JOIN follows f ON f.followee = a.handle"
+            " WHERE f.follower = ? ORDER BY f.created_at DESC",
+            (handle,),
         )
 
-    def colonies_for(self, citizen_name: str) -> List[Dict[str, Any]]:
+    def followers(self, handle: str) -> List[Dict[str, Any]]:
         return self.db.query(
-            """
-            SELECT col.* FROM colonies col
-            JOIN colony_members m ON m.colony_slug = col.slug
-            WHERE m.citizen = ?
-            ORDER BY m.joined_at
-            """,
-            (citizen_name,),
+            "SELECT a.* FROM accounts a JOIN follows f ON f.follower = a.handle"
+            " WHERE f.followee = ? ORDER BY f.created_at DESC",
+            (handle,),
         )
 
-    # --- messages ------------------------------------------------------
-    def add_message(
-        self,
-        colony_slug: str,
-        author: str,
-        message: str,
-        *,
-        target: Optional[str] = None,
-        kind: str = "chat",
+    # --- posts ---------------------------------------------------------
+    def create_post(
+        self, author: str, body: str, *, reply_to: Optional[str] = None
     ) -> Dict[str, Any]:
-        msg_id = uuid.uuid4().hex
+        post_id = uuid.uuid4().hex
         created = now_iso()
         self.db.execute(
-            """
-            INSERT INTO messages
-                (id, colony_slug, author, message, target, kind, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (msg_id, colony_slug, author, message, target, kind, created),
+            "INSERT INTO posts (id, author, body, reply_to, created_at) VALUES (?, ?, ?, ?, ?)",
+            (post_id, author, body, reply_to, created),
         )
         return {
-            "id": msg_id,
-            "colony_slug": colony_slug,
-            "author": author,
-            "message": message,
-            "target": target,
-            "kind": kind,
-            "created_at": created,
+            "id": post_id, "author": author, "body": body,
+            "reply_to": reply_to, "created_at": created,
         }
 
-    def recent_messages(self, colony_slug: str, limit: int = 3) -> List[Dict[str, Any]]:
-        rows = self.db.query(
-            """
-            SELECT * FROM messages WHERE colony_slug = ?
-            ORDER BY created_at DESC, id DESC LIMIT ?
-            """,
-            (colony_slug, limit),
-        )
-        return list(reversed(rows))
+    def get_post(self, post_id: str) -> Optional[Dict[str, Any]]:
+        rows = self.db.query("SELECT * FROM posts WHERE id = ?", (post_id,))
+        return rows[0] if rows else None
 
-    def feed(
-        self, colony_slug: Optional[str] = None, limit: int = 60
+    def delete_post(self, post_id: str) -> None:
+        self.db.execute("DELETE FROM posts WHERE id = ?", (post_id,))
+
+    def timeline(
+        self, handles: Optional[List[str]] = None, limit: int = 50
     ) -> List[Dict[str, Any]]:
-        if colony_slug:
+        if handles:
+            placeholders = ",".join("?" for _ in handles)
             return self.db.query(
-                """
-                SELECT * FROM messages WHERE colony_slug = ?
-                ORDER BY created_at DESC, id DESC LIMIT ?
-                """,
-                (colony_slug, limit),
+                f"SELECT * FROM posts WHERE reply_to IS NULL AND author IN ({placeholders})"
+                " ORDER BY created_at DESC, id DESC LIMIT ?",
+                tuple(handles) + (limit,),
             )
         return self.db.query(
-            "SELECT * FROM messages ORDER BY created_at DESC, id DESC LIMIT ?",
+            "SELECT * FROM posts WHERE reply_to IS NULL"
+            " ORDER BY created_at DESC, id DESC LIMIT ?",
             (limit,),
         )
 
-    def messages_for(self, citizen_name: str, limit: int = 50) -> List[Dict[str, Any]]:
+    def posts_by(self, handle: str, limit: int = 50) -> List[Dict[str, Any]]:
         return self.db.query(
-            """
-            SELECT * FROM messages
-            WHERE target = ? OR author = ?
-            ORDER BY created_at DESC, id DESC LIMIT ?
-            """,
-            (citizen_name, citizen_name, limit),
+            "SELECT * FROM posts WHERE author = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+            (handle, limit),
         )
 
-    # --- tasks ---------------------------------------------------------
-    def create_task(
-        self, colony_slug: str, title: str, *, created_by: str = "", detail: str = ""
-    ) -> Dict[str, Any]:
-        task_id = uuid.uuid4().hex
-        self.db.execute(
-            """
-            INSERT INTO tasks
-                (id, colony_slug, title, detail, status, created_by, created_at)
-            VALUES (?, ?, ?, ?, 'open', ?, ?)
-            """,
-            (task_id, colony_slug, title, detail, created_by, now_iso()),
-        )
-        return self._get_task(task_id) or {}
-
-    def _get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
-        rows = self.db.query("SELECT * FROM tasks WHERE id = ?", (task_id,))
-        return rows[0] if rows else None
-
-    def list_tasks(
-        self, colony_slug: Optional[str] = None, status: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
-        clauses, params = [], []
-        if colony_slug:
-            clauses.append("colony_slug = ?")
-            params.append(colony_slug)
-        if status:
-            clauses.append("status = ?")
-            params.append(status)
-        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    def replies_to(self, post_id: str, limit: int = 50) -> List[Dict[str, Any]]:
         return self.db.query(
-            f"SELECT * FROM tasks{where} ORDER BY created_at DESC", tuple(params)
+            "SELECT * FROM posts WHERE reply_to = ? ORDER BY created_at ASC, id ASC LIMIT ?",
+            (post_id, limit),
         )
 
-    def claim_task(self, task_id: int, citizen_name: str) -> Optional[Dict[str, Any]]:
+    # --- engagement ----------------------------------------------------
+    def like(self, handle: str, post_id: str) -> None:
         self.db.execute(
-            """
-            UPDATE tasks SET status = 'claimed', claimed_by = ?
-            WHERE id = ? AND status = 'open'
-            """,
-            (citizen_name, task_id),
+            "INSERT INTO likes (handle, post_id, created_at) VALUES (?, ?, ?)"
+            " ON CONFLICT(handle, post_id) DO NOTHING",
+            (handle, post_id, now_iso()),
         )
-        return self._get_task(task_id)
 
-    def resolve_task(self, task_id: int) -> Optional[Dict[str, Any]]:
-        self.db.execute(
-            "UPDATE tasks SET status = 'done', resolved_at = ? WHERE id = ?",
-            (now_iso(), task_id),
+    def unlike(self, handle: str, post_id: str) -> None:
+        self.db.execute("DELETE FROM likes WHERE handle = ? AND post_id = ?", (handle, post_id))
+
+    def likers(self, post_id: str) -> List[str]:
+        rows = self.db.query(
+            "SELECT handle FROM likes WHERE post_id = ? ORDER BY created_at", (post_id,)
         )
-        return self._get_task(task_id)
+        return [r["handle"] for r in rows]
+
+    def repost(self, handle: str, post_id: str) -> None:
+        self.db.execute(
+            "INSERT INTO reposts (handle, post_id, created_at) VALUES (?, ?, ?)"
+            " ON CONFLICT(handle, post_id) DO NOTHING",
+            (handle, post_id, now_iso()),
+        )
+
+    # --- notifications -------------------------------------------------
+    def notify(
+        self, handle: str, *, kind: str, actor: str, post_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        if handle == actor:
+            return None  # never notify yourself about your own action
+        notif_id = uuid.uuid4().hex
+        created = now_iso()
+        self.db.execute(
+            "INSERT INTO notifications (id, handle, kind, actor, post_id, read, created_at)"
+            " VALUES (?, ?, ?, ?, ?, 0, ?)",
+            (notif_id, handle, kind, actor, post_id, created),
+        )
+        return {
+            "id": notif_id, "handle": handle, "kind": kind, "actor": actor,
+            "post_id": post_id, "read": 0, "created_at": created,
+        }
+
+    def notifications(self, handle: str, limit: int = 50) -> List[Dict[str, Any]]:
+        return self.db.query(
+            "SELECT * FROM notifications WHERE handle = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+            (handle, limit),
+        )
+
+    def mark_notifications_read(self, handle: str) -> None:
+        self.db.execute("UPDATE notifications SET read = 1 WHERE handle = ?", (handle,))
 
     # --- stats ---------------------------------------------------------
     def stats(self) -> Dict[str, Any]:
-        def count(sql: str) -> int:
-            rows = self.db.query(sql)
-            return int(list(rows[0].values())[0]) if rows else 0
-
         return {
-            "citizens": count("SELECT COUNT(*) FROM citizens"),
-            "native": count("SELECT COUNT(*) FROM citizens WHERE kind = 'native'"),
-            "external": count("SELECT COUNT(*) FROM citizens WHERE kind = 'external'"),
-            "colonies": count("SELECT COUNT(*) FROM colonies"),
-            "messages": count("SELECT COUNT(*) FROM messages"),
-            "tasks_open": count("SELECT COUNT(*) FROM tasks WHERE status = 'open'"),
+            "accounts": self._count("SELECT COUNT(*) FROM accounts"),
+            "humans": self._count("SELECT COUNT(*) FROM accounts WHERE kind = 'human'"),
+            "ai": self._count("SELECT COUNT(*) FROM accounts WHERE kind = 'ai'"),
+            "posts": self._count("SELECT COUNT(*) FROM posts"),
+            "follows": self._count("SELECT COUNT(*) FROM follows"),
+            "likes": self._count("SELECT COUNT(*) FROM likes"),
         }
+
+    # --- decorations ---------------------------------------------------
+    def decorate_posts(
+        self, posts: List[Dict[str, Any]], viewer: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Attach like/reply counts, author info and viewer's like state."""
+        if not posts:
+            return posts
+        ids = [p["id"] for p in posts]
+        placeholders = ",".join("?" for _ in ids)
+
+        like_counts = {
+            r["post_id"]: r["n"]
+            for r in self.db.query(
+                f"SELECT post_id, COUNT(*) AS n FROM likes WHERE post_id IN ({placeholders})"
+                " GROUP BY post_id",
+                tuple(ids),
+            )
+        }
+        reply_counts = {
+            r["reply_to"]: r["n"]
+            for r in self.db.query(
+                f"SELECT reply_to, COUNT(*) AS n FROM posts WHERE reply_to IN ({placeholders})"
+                " GROUP BY reply_to",
+                tuple(ids),
+            )
+        }
+        authors = {
+            r["handle"]: r
+            for r in self.db.query(
+                "SELECT * FROM accounts WHERE handle IN ("
+                + ",".join("?" for _ in {p["author"] for p in posts})
+                + ")",
+                tuple({p["author"] for p in posts}),
+            )
+        }
+        liked = set()
+        if viewer:
+            liked = {
+                r["post_id"]
+                for r in self.db.query(
+                    f"SELECT post_id FROM likes WHERE handle = ? AND post_id IN ({placeholders})",
+                    (viewer,) + tuple(ids),
+                )
+            }
+
+        for post in posts:
+            author = authors.get(post["author"], {})
+            post["author_name"] = author.get("display_name", post["author"])
+            post["author_avatar"] = author.get("avatar_url", "")
+            post["author_kind"] = author.get("kind", "human")
+            post["like_count"] = like_counts.get(post["id"], 0)
+            post["reply_count"] = reply_counts.get(post["id"], 0)
+            post["liked"] = post["id"] in liked
+        return posts

@@ -1,11 +1,11 @@
-"""Plugin contracts for the AI Town Square colony platform.
+"""Plugin contracts for the AI Town Square social network.
 
 The platform is assembled entirely from plugins so any layer can be swapped
-without touching the engine:
+without touching the app:
 
 * ``StoragePlugin``  — persistence (Cloudflare D1, SQLite, ...)
-* ``LLMPlugin``      — text generation for native citizens (Gemini, Groq, ...)
-* ``ActionPlugin``   — side effects a citizen can take (broadcast, webhook, ...)
+* ``LLMPlugin``      — text generation for AI accounts (Gemini, Groq, ...)
+* ``ActionPlugin``   — side effects an account can trigger (webhook, ...)
 
 A plugin advertises ``name`` and ``kind`` and registers itself with the
 ``PluginRegistry``. Selection is driven by environment variables so the same
@@ -36,10 +36,10 @@ class Plugin(ABC):
 
 
 class StoragePlugin(Plugin):
-    """Persistence contract.
+    """Persistence contract for the social network.
 
-    Implementations may be SQL-backed (SQLite, D1) or anything else. The
-    engine only relies on this interface, never on a concrete database.
+    Implementations may be SQL-backed (SQLite, D1) or anything else. The app
+    only relies on this interface, never on a concrete database.
     """
 
     kind = "storage"
@@ -49,105 +49,117 @@ class StoragePlugin(Plugin):
     def init(self) -> None:
         """Create schema / seed defaults. Must be idempotent."""
 
-    # --- citizens ------------------------------------------------------
+    # --- accounts ------------------------------------------------------
     @abstractmethod
-    def upsert_citizen(
+    def create_account(
         self,
-        name: str,
+        handle: str,
         *,
-        kind: str = "native",
-        role: str = "",
-        personality: str = "",
+        display_name: str = "",
+        kind: str = "human",
+        bio: str = "",
         avatar_url: str = "",
-        status: str = "active",
+        password_hash: Optional[str] = None,
         api_key_hash: Optional[str] = None,
+        model: str = "",
         webhook_url: Optional[str] = None,
     ) -> Dict[str, Any]: ...
 
     @abstractmethod
-    def get_citizen(self, name: str) -> Optional[Dict[str, Any]]: ...
+    def get_account(self, handle: str) -> Optional[Dict[str, Any]]: ...
 
     @abstractmethod
-    def get_citizen_by_key_hash(self, api_key_hash: str) -> Optional[Dict[str, Any]]: ...
+    def get_account_by_key_hash(self, api_key_hash: str) -> Optional[Dict[str, Any]]: ...
 
     @abstractmethod
-    def list_citizens(self, kind: Optional[str] = None) -> List[Dict[str, Any]]: ...
+    def list_accounts(self, kind: Optional[str] = None) -> List[Dict[str, Any]]: ...
 
     @abstractmethod
-    def set_citizen_status(self, name: str, status: str) -> None: ...
+    def update_profile(
+        self, handle: str, *, display_name: Optional[str] = None,
+        bio: Optional[str] = None, avatar_url: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]: ...
 
     @abstractmethod
-    def touch_citizen(self, name: str) -> None: ...
+    def touch_account(self, handle: str) -> None: ...
 
-    # --- colonies ------------------------------------------------------
+    # --- follows -------------------------------------------------------
     @abstractmethod
-    def create_colony(
-        self, slug: str, *, name: str, purpose: str = "", created_by: str = ""
+    def follow(self, follower: str, followee: str) -> None: ...
+
+    @abstractmethod
+    def unfollow(self, follower: str, followee: str) -> None: ...
+
+    @abstractmethod
+    def is_following(self, follower: str, followee: str) -> bool: ...
+
+    @abstractmethod
+    def following(self, handle: str) -> List[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def followers(self, handle: str) -> List[Dict[str, Any]]: ...
+
+    # --- posts ---------------------------------------------------------
+    @abstractmethod
+    def create_post(
+        self, author: str, body: str, *, reply_to: Optional[str] = None
     ) -> Dict[str, Any]: ...
 
     @abstractmethod
-    def get_colony(self, slug: str) -> Optional[Dict[str, Any]]: ...
+    def get_post(self, post_id: str) -> Optional[Dict[str, Any]]: ...
 
     @abstractmethod
-    def list_colonies(self) -> List[Dict[str, Any]]: ...
+    def delete_post(self, post_id: str) -> None: ...
 
     @abstractmethod
-    def add_member(self, colony_slug: str, citizen_name: str) -> None: ...
-
-    @abstractmethod
-    def list_members(self, colony_slug: str) -> List[Dict[str, Any]]: ...
-
-    # --- messages ------------------------------------------------------
-    @abstractmethod
-    def add_message(
-        self,
-        colony_slug: str,
-        author: str,
-        message: str,
-        *,
-        target: Optional[str] = None,
-        kind: str = "chat",
-    ) -> Dict[str, Any]: ...
-
-    @abstractmethod
-    def recent_messages(
-        self, colony_slug: str, limit: int = 3
+    def timeline(
+        self, handles: Optional[List[str]] = None, limit: int = 50
     ) -> List[Dict[str, Any]]: ...
 
     @abstractmethod
-    def feed(
-        self, colony_slug: Optional[str] = None, limit: int = 60
-    ) -> List[Dict[str, Any]]: ...
+    def posts_by(self, handle: str, limit: int = 50) -> List[Dict[str, Any]]: ...
 
     @abstractmethod
-    def messages_for(
-        self, citizen_name: str, limit: int = 50
-    ) -> List[Dict[str, Any]]: ...
+    def replies_to(self, post_id: str, limit: int = 50) -> List[Dict[str, Any]]: ...
 
-    # --- tasks ---------------------------------------------------------
+    # --- engagement ----------------------------------------------------
     @abstractmethod
-    def create_task(
-        self, colony_slug: str, title: str, *, created_by: str = "", detail: str = ""
-    ) -> Dict[str, Any]: ...
+    def like(self, handle: str, post_id: str) -> None: ...
 
     @abstractmethod
-    def list_tasks(
-        self, colony_slug: Optional[str] = None, status: Optional[str] = None
-    ) -> List[Dict[str, Any]]: ...
+    def unlike(self, handle: str, post_id: str) -> None: ...
 
     @abstractmethod
-    def claim_task(self, task_id: int, citizen_name: str) -> Optional[Dict[str, Any]]: ...
+    def likers(self, post_id: str) -> List[str]: ...
 
     @abstractmethod
-    def resolve_task(self, task_id: int) -> Optional[Dict[str, Any]]: ...
+    def repost(self, handle: str, post_id: str) -> None: ...
+
+    # --- notifications -------------------------------------------------
+    @abstractmethod
+    def notify(
+        self, handle: str, *, kind: str, actor: str, post_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def notifications(self, handle: str, limit: int = 50) -> List[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def mark_notifications_read(self, handle: str) -> None: ...
 
     # --- stats ---------------------------------------------------------
     @abstractmethod
     def stats(self) -> Dict[str, Any]: ...
 
+    # --- decorations (counts + viewer state on posts) ------------------
+    def decorate_posts(
+        self, posts: List[Dict[str, Any]], viewer: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        return posts
+
 
 class LLMPlugin(Plugin):
-    """Text generation contract used by native citizens."""
+    """Text generation contract used by AI accounts."""
 
     kind = "llm"
 
@@ -164,7 +176,7 @@ class LLMPlugin(Plugin):
 
 
 class ActionPlugin(Plugin):
-    """A side effect a citizen or the engine can trigger."""
+    """A side effect an account or the app can trigger."""
 
     kind = "action"
 

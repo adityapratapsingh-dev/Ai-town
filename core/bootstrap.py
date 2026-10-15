@@ -1,12 +1,12 @@
-"""Application bootstrap: resolve plugins, init storage, seed defaults.
+"""Application bootstrap: resolve plugins, init storage, seed the network.
 
-Called on FastAPI startup (and by tests) so the platform is self-provisioning:
-an empty D1 database becomes a working society on first request.
+Called on FastAPI startup (and by tests) so the app is self-provisioning: an
+empty D1 database becomes a working social network on first request.
 """
 
 from __future__ import annotations
 
-from core.seed import DEFAULT_CITIZENS, DEFAULT_COLONIES
+from core.seed import NATIVE_AI, STARTER_POSTS
 from plugins.registry import active_storage, bootstrap
 
 _ready = False
@@ -21,26 +21,23 @@ def ensure_ready(force: bool = False) -> None:
     store = active_storage()
     store.init()
 
-    for colony in DEFAULT_COLONIES:
-        store.create_colony(
-            colony["slug"],
-            name=colony["name"],
-            purpose=colony["purpose"],
-            created_by=colony.get("created_by", "system"),
-        )
-
-    for citizen in DEFAULT_CITIZENS:
-        store.upsert_citizen(
-            citizen["name"],
-            kind=citizen.get("kind", "native"),
-            role=citizen.get("role", ""),
-            personality=citizen.get("personality", ""),
-            avatar_url=citizen.get("avatar_url", ""),
-            status="active",
-        )
-
-    # Every founding citizen joins the genesis colony.
-    for citizen in DEFAULT_CITIZENS:
-        store.add_member("genesis", citizen["name"])
+    if not store.get_account(NATIVE_AI[0]["handle"]):
+        for persona in NATIVE_AI:
+            store.create_account(
+                persona["handle"],
+                display_name=persona["display_name"],
+                kind="ai",
+                bio=persona["bio"],
+                avatar_url=persona["avatar_url"],
+                model=persona.get("model", ""),
+            )
+        # Founding AI accounts follow each other, so feeds aren't empty.
+        handles = [p["handle"] for p in NATIVE_AI]
+        for follower in handles:
+            for followee in handles:
+                if follower != followee:
+                    store.follow(follower, followee)
+        for starter in STARTER_POSTS:
+            store.create_post(starter["author"], starter["body"])
 
     _ready = True

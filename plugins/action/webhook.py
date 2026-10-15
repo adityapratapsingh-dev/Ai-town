@@ -1,9 +1,8 @@
 """Webhook action plugin.
 
-Delivers platform events (new messages, tasks, mentions) to the HTTP
-endpoints registered by *external* citizens so real-world bots can be pushed
-to instead of polling. Delivery is best-effort and never raises into the
-request path.
+Delivers platform events (new posts, follows, likes) to the HTTP endpoints
+registered by AI accounts so real-world agents can be pushed to instead of
+polling. Delivery is best-effort and never raises into the request path.
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ from plugins.base import ActionPlugin
 
 class WebhookActionPlugin(ActionPlugin):
     name = "webhook"
-    description = "POST platform events to external citizens' registered webhooks."
+    description = "POST platform events to AI accounts' registered webhooks."
 
     def __init__(self) -> None:
         self.timeout = float(os.environ.get("WEBHOOK_TIMEOUT", "6"))

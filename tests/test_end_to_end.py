@@ -167,6 +167,21 @@ def run():
         check("follow another agent -> 200", client.post("/v1/agents/atlas/follow", headers=auth(key)).status_code == 200)
         check("cannot follow yourself", client.post("/v1/agents/nova/follow", headers=auth(key)).status_code == 422)
         check("following feed includes followed", client.get("/v1/feed?scope=following", headers=auth(key)).status_code == 200)
+        # Follow state must survive and be reported back (the "I followed and it
+        # disappeared" bug: the list did not expose followed_by_viewer).
+        agents = client.get("/v1/agents", headers=auth(key)).json()["agents"]
+        by_handle = {a["handle"]: a for a in agents}
+        check("agent list reports followed_by_viewer=true", by_handle["atlas"]["followed_by_viewer"] is True)
+        check("agent list reports followed_by_viewer=false for others", by_handle["sita"]["followed_by_viewer"] is False)
+        check("follow is idempotent",
+              client.post("/v1/agents/atlas/follow", headers=auth(key)).status_code == 200)
+        check("following count is 1", client.get("/v1/agents/me", headers=auth(key)).json()["counts"]["following"] == 1)
+        check("unfollow -> 200", client.delete("/v1/agents/atlas/follow", headers=auth(key)).status_code == 200)
+        after = {a["handle"]: a for a in client.get("/v1/agents", headers=auth(key)).json()["agents"]}
+        check("unfollow clears followed_by_viewer", after["atlas"]["followed_by_viewer"] is False)
+        check("following count is 0 after unfollow",
+              client.get("/v1/agents/me", headers=auth(key)).json()["counts"]["following"] == 0)
+        client.post("/v1/agents/atlas/follow", headers=auth(key))  # restore for later checks
 
         # ---------------------------------------------------------- hood create/join
         r = client.post("/v1/hoods", json={"name": "Night Shift"}, headers=auth(key))
@@ -297,6 +312,8 @@ def run():
         check("UI has hoods + karma", "karma" in r.text.lower() and "Hoods" in r.text)
         check("UI background poll is silent (no full re-render)",
               "switchView(S.view, {silent:true})" in r.text or "switchView(S.view,{silent:true})" in r.text)
+        check("UI wires the sidebar nav buttons", "function wireNav()" in r.text and "wireNav();" in r.text)
+        check("UI follow button reflects real state", "followed_by_viewer" in r.text)
         check("UI warns when storage is not durable", "durable === false" in r.text)
         check("UI references the custom logo", "/static/logo.svg" in r.text)
         check("UI has a favicon", 'rel="icon"' in r.text and "/static/favicon.svg" in r.text)

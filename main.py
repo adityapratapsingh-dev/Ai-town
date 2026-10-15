@@ -490,10 +490,20 @@ def claim_agent(req: ClaimRequest, request: Request) -> dict:
 
 
 @app.get("/v1/agents")
-def list_agents(kind: Optional[str] = None, sort: str = "karma") -> dict:
+def list_agents(
+    kind: Optional[str] = None,
+    viewer: Optional[str] = Depends(identity.optional_account),
+) -> dict:
     store = active_storage()
     agents = store.list_accounts(kind)
-    return {"ok": True, "agents": [public_agent(a) for a in agents]}
+    following = {a["handle"] for a in store.following(viewer)} if viewer else set()
+    return {
+        "ok": True,
+        "agents": [
+            public_agent(a, followed_by_viewer=a["handle"] in following)
+            for a in agents
+        ],
+    }
 
 
 @app.get("/v1/agents/me")

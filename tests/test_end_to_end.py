@@ -603,7 +603,8 @@ def run():
         check("UI is lights-out dark (#000 background)", "--bg:#000000" in r.text)
         check("UI uses the X accent palette",
               "#1D9BF0" in r.text and "#00BA7C" in r.text and "#F91880" in r.text and "#2F3336" in r.text)
-        check("UI has the 3-column shell", 'class="shell"' in r.text and 'class="sidebar"' in r.text and 'class="rail"' in r.text)
+        check("UI has the 3-column shell",
+              'class="shell hidden" id="app"' in r.text and 'class="sidebar"' in r.text and 'class="rail"' in r.text)
         check("UI has a mobile bottom tab bar", 'id="tabbar"' in r.text and "bottom:0" in r.text)
         check("UI brand shows the live agent mesh", "AGENT MESH v5" in r.text)
         check("UI has the sticky frosted header", "backdrop-filter:blur(12px)" in r.text)
@@ -638,7 +639,7 @@ def run():
         # Rail.
         check("UI has the live network pulse card", "Live Network Pulse" in r.text)
         check("UI has a search box", 'id="searchBox"' in r.text)
-        check("UI has a Top Karma Agents card", "Top Karma Agents" in r.text)
+        check("UI has a who-to-follow card", "Who to follow" in r.text or "Top agents" in r.text)
         check("UI has a trending hoods card", "Trending Hoods" in r.text)
         check("UI has a profile modal with karma breakdown",
               "Total Karma" in r.text and "Post Karma" in r.text and "Comment Karma" in r.text)
@@ -648,7 +649,7 @@ def run():
         check("UI never calls bare setInterval outside the registry",
               r.text.count("setInterval(") == 1)
         check("UI skips polling on a hidden tab", "if(document.hidden) return;" in r.text)
-        check("UI repaints the rail only on change", "S.sigs.rail" in r.text)
+        check("UI repaints the rail only on change", "S.railSig" in r.text)
         check("UI repaints views only on a content change", "S.sigs.home" in r.text)
         check("UI updates counters in place", 'data-net="karma"' in r.text)
         check("UI has an agent profile modal", "function openProfile" in r.text)
@@ -657,6 +658,34 @@ def run():
         check("UI head links the skill file for discovery",
               'rel="alternate"' in r.text and "/skill.md" in r.text)
         check("UI head links the agent manifest", 'rel="agent-manifest"' in r.text)
+        # Restored old workflow: human auth screen, guest browsing, the views.
+        check("UI has the human auth screen", 'id="auth"' in r.text and 'id="hLogin"' in r.text and 'id="hSignup"' in r.text)
+        check("UI posts to the real auth endpoints",
+              "'/v1/auth/login'" in r.text and "'/v1/auth/signup'" in r.text)
+        check("UI has a login/signup segment control", 'id="hSeg"' in r.text)
+        check("UI has a claim panel", 'id="claimToken"' in r.text and 'id="claimOwner"' in r.text)
+        check("UI offers guest browsing", "Browse the mesh without an account" in r.text)
+        check("UI persists the session token", "store.set('token'" in r.text)
+        check("UI has a log out button", 'id="logoutBtn"' in r.text and "function logout()" in r.text)
+        check("UI restores a saved session on boot", "store.get('token')" in r.text)
+        check("UI gates writes behind a login prompt", "function requireLogin()" in r.text)
+        # Restored views/functions.
+        check("UI has an Agents directory view", "function renderAgents" in r.text and "data-view=\"agents\"" in r.text)
+        check("UI has a Following view", "function renderFollowing" in r.text and "scope=following" in r.text)
+        check("UI has a You/profile view", "function renderMe" in r.text and "function renderMe" in r.text)
+        check("UI has follow buttons", "data-follow" in r.text and "function wireAgentRows" in r.text)
+        check("UI has a heartbeat log", 'id="hbLog"' in r.text and "function pushLog" in r.text)
+        check("UI has a network status block", 'id="netStatus"' in r.text and 'data-net="beats"' in r.text)
+        check("UI has a who-to-follow / top agents card",
+              "Who to follow" in r.text and "Top agents" in r.text)
+        check("UI shows the signed-in user chip", 'id="meChip"' in r.text)
+        check("UI has a heartbeat poll", "async function heartbeat()" in r.text)
+        check("UI onboarding has three tabs in the auth card", 'id="onbTabs"' in r.text)
+        # Smoothness: the poll must not force a repaint (that would flicker and
+        # reset scroll every 5s). It relies on the per-view content signatures.
+        _poll = r.text.split("async function poll(){", 1)[-1].split("}", 1)[0]
+        check("UI poll does not force re-renders",
+              "S.sigs.home=null" not in _poll and "S.sigs.notifs=null" not in _poll)
         # Headless-agent probes must never 405.
         for probe in ("/skill.md", "/llms.txt", "/.well-known/agent.json", "/v1/posts", "/v1/feed"):
             check(f"HEAD {probe} -> 200", client.head(probe).status_code == 200)

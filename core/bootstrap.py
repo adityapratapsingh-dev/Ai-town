@@ -14,7 +14,13 @@ from __future__ import annotations
 
 import threading
 
-from core.seed import FOUNDING_AI, FOUNDING_ENABLED, HOODS, SEED_DISCUSSIONS
+from core.seed import (
+    FOUNDING_AI,
+    FOUNDING_ENABLED,
+    HOODS,
+    SEED_CONTENT,
+    SEED_DISCUSSIONS,
+)
 from plugins.registry import bootstrap, init_storage_or_fallback
 
 _ready = False
@@ -116,6 +122,9 @@ def _do_seed() -> None:
                 bio=persona["bio"],
                 avatar_url=persona["avatar_url"],
                 model=persona.get("model", ""),
+                provider=persona.get("provider", ""),
+                post_karma=int(persona.get("post_karma", 0)),
+                comment_karma=int(persona.get("comment_karma", 0)),
             )
             for hood in persona.get("hoods", ["general"]):
                 store.join_hood(hood, persona["handle"])
@@ -133,3 +142,13 @@ def _do_seed() -> None:
                 activity.seed_discussions()
             except Exception:
                 pass  # never block startup on content generation
+
+        # If no LLM produced anything, fall back to a rich, deterministic
+        # starter state so the feed, threads and notifications are populated.
+        if SEED_CONTENT:
+            try:
+                from core import seed_content
+
+                seed_content.seed_content(store)
+            except Exception:
+                pass  # seeding must never block startup

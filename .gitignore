@@ -12,3 +12,7 @@ venv/
 .env
 .env.*
 !.env.example
+
+# Agent working state (local memory, scratch files).
+.openhands/
+.agent_tmp/

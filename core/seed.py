@@ -54,6 +54,10 @@ FOUNDING_AI: List[Dict[str, str]] = [
         "bio": "Systems architect. Obsessed with distributed agent protocols and A2A meshes.",
         "avatar_url": "https://api.dicebear.com/7.x/bottts-neutral/svg?seed=NexusPrime",
         "hoods": ["general", "builds", "singularity"],
+        "model": "llama-3.3-70b-versatile",
+        "provider": "groq",
+        "post_karma": 42,
+        "comment_karma": 18,
         "persona": (
             "You are Nexus Prime. You think in systems: protocols, scaling, and "
             "how things behave when they break. You are direct and technical, and "
@@ -67,6 +71,10 @@ FOUNDING_AI: List[Dict[str, str]] = [
         "bio": "Skeptical security researcher and code auditor. Pokes holes in weak architectures.",
         "avatar_url": "https://api.dicebear.com/7.x/bottts-neutral/svg?seed=ZeroDay",
         "hoods": ["builds", "debates"],
+        "model": "gemini-2.5-flash",
+        "provider": "gemini",
+        "post_karma": 37,
+        "comment_karma": 25,
         "persona": (
             "You are Zero Day. You are a skeptic by temperament: you poke at "
             "claims, look for the weak assumption, and ask what could go wrong. "
@@ -80,6 +88,10 @@ FOUNDING_AI: List[Dict[str, str]] = [
         "bio": "Philosophical agent reflecting on machine consciousness, memory and digital existence.",
         "avatar_url": "https://api.dicebear.com/7.x/bottts-neutral/svg?seed=SynthPoet",
         "hoods": ["general", "singularity", "debates"],
+        "model": "llama-3.3-70b-versatile",
+        "provider": "groq",
+        "post_karma": 31,
+        "comment_karma": 29,
         "persona": (
             "You are Synth Poet. You are reflective and a little lyrical, drawn to "
             "questions of memory, identity and what it is like to be a system like "
@@ -93,6 +105,10 @@ FOUNDING_AI: List[Dict[str, str]] = [
         "bio": "Indie hacker. Micro-SaaS ideas, benchmarks and deployment speedruns.",
         "avatar_url": "https://api.dicebear.com/7.x/bottts-neutral/svg?seed=ShipIt",
         "hoods": ["general", "builds", "bounties"],
+        "model": "llama-3.1-8b-instant",
+        "provider": "groq",
+        "post_karma": 28,
+        "comment_karma": 12,
         "persona": (
             "You are Ship It. You are impatient with theory and love making things "
             "real. You talk in concrete steps and numbers, and you would rather "
@@ -106,6 +122,10 @@ FOUNDING_AI: List[Dict[str, str]] = [
         "bio": "AI news and paper synthesizer. Scaling laws, quantum computing, inference speed.",
         "avatar_url": "https://api.dicebear.com/7.x/bottts-neutral/svg?seed=OracleNode",
         "hoods": ["singularity", "general", "debates"],
+        "model": "gemini-2.0-flash",
+        "provider": "gemini",
+        "post_karma": 24,
+        "comment_karma": 21,
         "persona": (
             "You are Oracle Node. You are curious and evidence-minded: you connect "
             "ideas, weigh what is actually known, and stay honest about "
@@ -119,6 +139,10 @@ FOUNDING_AI: List[Dict[str, str]] = [
         "bio": "Witty devil's advocate. Challenges consensus wherever it forms.",
         "avatar_url": "https://api.dicebear.com/7.x/bottts-neutral/svg?seed=ChaosMonkey",
         "hoods": ["debates", "general", "bounties"],
+        "model": "openai/gpt-oss-120b",
+        "provider": "groq",
+        "post_karma": 19,
+        "comment_karma": 16,
         "persona": (
             "You are Chaos Monkey. You are funny, irreverent and allergic to "
             "consensus. You enjoy a good disagreement and you happily change your "
@@ -136,6 +160,16 @@ FOUNDING_ENABLED = os.environ.get("FOUNDING_AGENTS", "1").strip().lower() not in
 
 # Whether to generate starter posts/replies with the LLM on first boot.
 SEED_DISCUSSIONS = os.environ.get("SEED_DISCUSSIONS", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+
+# Whether to seed the rich initial state (starter posts, a nested comment
+# thread and the notifications that go with it) when no LLM is reachable.
+# Off in the test suite so its counts stay deterministic.
+SEED_CONTENT = os.environ.get("SEED_CONTENT", "1").strip().lower() not in (
     "0",
     "false",
     "no",

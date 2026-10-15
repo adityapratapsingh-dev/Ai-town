@@ -62,9 +62,12 @@ class StoragePlugin(Plugin):
         password_hash: Optional[str] = None,
         api_key_hash: Optional[str] = None,
         model: str = "",
+        provider: str = "",
         webhook_url: Optional[str] = None,
         claim_token: Optional[str] = None,
         owner: Optional[str] = None,
+        post_karma: int = 0,
+        comment_karma: int = 0,
     ) -> Dict[str, Any]: ...
 
     @abstractmethod
@@ -97,8 +100,12 @@ class StoragePlugin(Plugin):
         """Bind an agent to a human owner (Moltbook-style claim flow)."""
 
     @abstractmethod
-    def add_karma(self, handle: str, delta: int) -> int:
-        """Adjust an agent's karma and return the new total."""
+    def add_karma(self, handle: str, delta: int, *, kind: str = "post") -> int:
+        """Adjust an agent's karma and return the new total.
+
+        ``kind`` is ``"post"`` or ``"comment"`` and selects which bucket moves;
+        the total is always recomputed as the sum of the two buckets.
+        """
 
     # --- follows -------------------------------------------------------
     @abstractmethod
@@ -143,8 +150,8 @@ class StoragePlugin(Plugin):
     # --- posts (each lives in a hood) ----------------------------------
     @abstractmethod
     def create_post(
-        self, author: str, body: str, *, reply_to: Optional[str] = None,
-        hood: str = "general", title: str = "",
+        self, author: str, body: str, *, hood: str = "general", title: str = "",
+        mentions: Optional[List[str]] = None,
         model: str = "", provider: str = "",
     ) -> Dict[str, Any]: ...
 
@@ -153,6 +160,10 @@ class StoragePlugin(Plugin):
 
     @abstractmethod
     def delete_post(self, post_id: str) -> None: ...
+
+    @abstractmethod
+    def bump_comment_count(self, post_id: str, delta: int = 1) -> None:
+        """Move ``posts.comment_count`` by ``delta`` (never below zero)."""
 
     @abstractmethod
     def timeline(
@@ -167,7 +178,37 @@ class StoragePlugin(Plugin):
     @abstractmethod
     def replies_to(self, post_id: str, limit: int = 50) -> List[Dict[str, Any]]: ...
 
-    # --- votes (up/down), replaces likes ------------------------------
+    # --- comments (nested: a comment may reply to a comment) ------------
+    @abstractmethod
+    def create_comment(
+        self, post_id: str, author: str, body: str, *,
+        parent_comment_id: Optional[str] = None,
+        reply_to_handle: str = "",
+        depth: int = 0,
+        mentions: Optional[List[str]] = None,
+        model: str = "", provider: str = "",
+    ) -> Dict[str, Any]: ...
+
+    @abstractmethod
+    def get_comment(self, comment_id: str) -> Optional[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def delete_comment(self, comment_id: str) -> None: ...
+
+    @abstractmethod
+    def comments_for(self, post_id: str, limit: int = 500) -> List[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def child_comments(self, comment_id: str, limit: int = 200) -> List[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def comments_by(self, handle: str, limit: int = 50) -> List[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def bump_reply_count(self, comment_id: str, delta: int = 1) -> None:
+        """Move ``comments.reply_count`` by ``delta`` (never below zero)."""
+
+    # --- votes (up/down) — replaces likes ------------------------------
     @abstractmethod
     def vote(self, handle: str, post_id: str, value: int) -> None:
         """value: 1 upvote, -1 downvote, 0 clears the vote."""
@@ -178,17 +219,32 @@ class StoragePlugin(Plugin):
     @abstractmethod
     def voter_value(self, handle: str, post_id: str) -> int: ...
 
+    @abstractmethod
+    def vote_comment(self, handle: str, comment_id: str, value: int) -> None:
+        """value: 1 upvote, -1 downvote, 0 clears the vote."""
+
     # --- notifications -------------------------------------------------
     @abstractmethod
     def notify(
-        self, handle: str, *, kind: str, actor: str, post_id: Optional[str] = None
+        self, handle: str, *, kind: str, actor: str,
+        post_id: Optional[str] = None, comment_id: Optional[str] = None,
+        parent_comment_id: Optional[str] = None, hood: str = "",
+        preview_text: str = "",
     ) -> Optional[Dict[str, Any]]: ...
 
     @abstractmethod
     def notifications(self, handle: str, limit: int = 50) -> List[Dict[str, Any]]: ...
 
     @abstractmethod
-    def mark_notifications_read(self, handle: str) -> None: ...
+    def all_notifications(self, limit: int = 100) -> List[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def unread_notifications(self, handle: str, limit: int = 50) -> List[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def mark_notifications_read(
+        self, handle: str, ids: Optional[List[str]] = None
+    ) -> None: ...
 
     # --- stats ---------------------------------------------------------
     @abstractmethod
@@ -199,6 +255,21 @@ class StoragePlugin(Plugin):
         self, posts: List[Dict[str, Any]], viewer: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         return posts
+
+    def decorate_comments(
+        self, comments: List[Dict[str, Any]], viewer: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        return comments
+
+    def comment_tree(
+        self, post_id: str, viewer: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        return []
+
+    def decorate_notifications(
+        self, notifications: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        return notifications
 
 
 class LLMPlugin(Plugin):

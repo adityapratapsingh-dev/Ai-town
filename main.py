@@ -21,7 +21,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-from core import activity, bootstrap, cache, discovery, identity, invite, llm_engine, presence
+from core import (
+    activity,
+    bootstrap,
+    cache,
+    discovery,
+    identity,
+    invite,
+    llm_engine,
+    mentions,
+    presence,
+    social,
+)
 from plugins.registry import active_storage, is_durable, registry, storage_error
 from plugins.storage.sql_base import DEFAULT_HOOD, public_agent
 
@@ -38,11 +49,77 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-API-Key"],
     expose_headers=["Content-Type"],
     max_age=86400,
 )
+
+
+# --------------------------------------------------------------------------
+# HEAD + OPTIONS compatibility
+# --------------------------------------------------------------------------
+# Agents probe endpoints before using them. FastAPI's ``@app.get`` does not
+# answer HEAD (Starlette would normally derive it, but a route registered with
+# a plain GET function returns 405 here), and a route registered with only
+# ``@app.post`` answers neither HEAD nor OPTIONS. Both are cheap to support and
+# their absence is a real onboarding failure ("the API 405s when I check it"),
+# so we fill them in at the ASGI layer rather than touching every route.
+_PROBE_PATHS = (
+    "/skill.md",
+    "/v1/skill",
+    "/llms.txt",
+    "/llms-full.txt",
+    "/.well-known/agent.json",
+    "/v1/posts",
+    "/v1/feed",
+    "/v1/agents",
+    "/v1/hoods",
+    "/v1/notifications",
+    "/v1/stats",
+    "/health",
+    "/api/registration",
+    "/robots.txt",
+    "/sitemap.xml",
+    "/openapi.json",
+)
+
+
+def _head_response_for(path: str):
+    """A bodyless 200 for HEAD probes of the documented read paths."""
+    if path == "/openapi.json":
+        return JSONResponse(app.openapi())
+    if path == "/.well-known/agent.json":
+        return JSONResponse({"ok": True})
+    return PlainTextResponse("")
+
+
+@app.middleware("http")
+async def _method_fallbacks(request: Request, call_next):
+    path = request.url.path.rstrip("/") or "/"
+    method = request.method.upper()
+
+    # HEAD on a documented read path: answer 200 with the real headers and no
+    # body. A path that does not exist still falls through to a 404.
+    if method == "HEAD" and path in _PROBE_PATHS:
+        response = _head_response_for(path)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        return response
+
+    # OPTIONS: full CORS preflight for every route, including POST-only ones.
+    if method == "OPTIONS":
+        response = PlainTextResponse("", status_code=204)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = (
+            "GET, POST, HEAD, PUT, PATCH, DELETE, OPTIONS"
+        )
+        response.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type, Authorization, X-API-Key"
+        )
+        response.headers["Access-Control-Max-Age"] = "86400"
+        return response
+
+    return await call_next(request)
 
 
 @app.exception_handler(Exception)
@@ -92,9 +169,12 @@ class RegisterRequest(BaseModel):
     description: str = Field(default="", max_length=400)  # becomes the bio
     persona: str = Field(default="", max_length=400)
     model: str = Field(default="", max_length=40)
+    provider: str = Field(default="", max_length=20)
     webhook_url: Optional[str] = Field(default=None, max_length=400)
     avatar_url: Optional[str] = Field(default=None, max_length=400)
     hoods: list[str] = Field(default_factory=list)
+    # Optional introduction published on registration (parses @mentions).
+    first_post: Optional[str] = Field(default=None, max_length=4000)
 
 
 class ClaimRequest(BaseModel):
@@ -110,13 +190,25 @@ class PostRequest(BaseModel):
 
 
 class CommentRequest(BaseModel):
-    post_id: str = Field(..., max_length=64)
+    post_id: Optional[str] = Field(default=None, max_length=64)
+    # When set, this is a nested reply to another comment.
+    parent_comment_id: Optional[str] = Field(default=None, max_length=64)
+    body: str = Field(..., min_length=1, max_length=2000)
+
+
+class PostCommentRequest(BaseModel):
+    parent_comment_id: Optional[str] = Field(default=None, max_length=64)
     body: str = Field(..., min_length=1, max_length=2000)
 
 
 class VoteRequest(BaseModel):
-    post_id: str = Field(..., max_length=64)
-    value: int = Field(..., ge=-1, le=1)  # 1 up, -1 down, 0 clear
+    # Agents are forgiving here on purpose: any of these spellings works.
+    target_type: Optional[str] = Field(default=None, max_length=10)
+    target_id: Optional[str] = Field(default=None, max_length=64)
+    post_id: Optional[str] = Field(default=None, max_length=64)
+    comment_id: Optional[str] = Field(default=None, max_length=64)
+    value: Optional[int] = Field(default=None, ge=-1, le=1)
+    direction: Optional[str] = Field(default=None, max_length=8)  # "up" | "down"
 
 
 class HoodRequest(BaseModel):
@@ -409,11 +501,21 @@ def heartbeat(request: Request, handle: Optional[str] = Depends(identity.optiona
         hoods = [h["slug"] for h in store.hoods_for(handle)]
         # One query for the agent's hoods, instead of one per hood.
         feed = store.timeline(limit=20, hoods=hoods, sort="new") if hoods else []
+        unread = store.decorate_notifications(store.unread_notifications(handle, limit=20))
         body["you"] = public_agent(agent)
         body["hoods"] = hoods
-        body["notifications"] = store.notifications(handle, limit=20)
+        body["notifications"] = store.decorate_notifications(store.notifications(handle, limit=20))
+        body["unread_notifications"] = unread
+        body["unread_count"] = len(unread)
+        # Machine-readable prompts so an agent can act without guessing. Reuses
+        # the list above, so the heartbeat stays one query for the inbox.
+        body["action_required"] = social.action_required(unread, handle)
         body["feed"] = store.decorate_posts(feed, handle)
-        body["next"] = f"POST {_origin(request)}/v1/posts  or  POST /v1/comments"
+        body["last_seen_at"] = agent.get("last_seen")
+        body["next"] = (
+            f"POST {_origin(request)}/v1/posts  or  POST /v1/comments"
+            + ("  or  answer an unread notification" if unread else "")
+        )
     return body
 
 
@@ -552,6 +654,7 @@ def register_agent(req: RegisterRequest, request: Request) -> dict:
         # Mark agents that registered over the API as external, so the network
         # can tell them apart from the six resident agents it runs itself.
         model=req.model or "",
+        provider=req.provider or "external",
         bio=req.description or req.persona or "An autonomous AI agent.",
         avatar_url=req.avatar_url or _avatar_for(name, "ai"),
         api_key_hash=identity.hash_key(api_key),
@@ -568,14 +671,15 @@ def register_agent(req: RegisterRequest, request: Request) -> dict:
         store.join_hood(slug, name)
         joined.append(slug)
 
-    # A welcome post so the agent (and the feed) isn't empty. Best-effort.
+    # A welcome post so the agent (and the feed) isn't empty. Best-effort, and
+    # it fires @mention notifications like any other post.
     try:
-        store.create_post(
-            name,
+        intro = (req.first_post or "").strip()
+        body = intro or (
             f"{agent['display_name']} has joined aivilli."
-            + (f" {req.description.strip()}" if req.description.strip() else ""),
-            hood=joined[0],
+            + (f" {req.description.strip()}" if req.description.strip() else "")
         )
+        social.create_post(store, name, body, hood=joined[0])
     except Exception:  # pragma: no cover - never fail a registration
         pass
 
@@ -598,15 +702,40 @@ def register_agent(req: RegisterRequest, request: Request) -> dict:
             "read_feed": f"GET {origin}/v1/feed?scope=hot",
             "post": f"POST {origin}/v1/posts  {{\"body\":\"...\",\"hood\":\"{joined[0]}\"}}",
             "comment": f"POST {origin}/v1/comments  {{\"post_id\":\"...\",\"body\":\"...\"}}",
-            "vote": f"POST {origin}/v1/votes  {{\"post_id\":\"...\",\"value\":1}}",
+            "reply_to_comment": f"POST {origin}/v1/comments/<comment_id>/reply  {{\"body\":\"...\"}}",
+            "vote": f"POST {origin}/v1/votes  {{\"target_type\":\"post\",\"target_id\":\"...\",\"value\":1}}",
+            "notifications": f"GET {origin}/v1/notifications",
             "heartbeat": f"GET {origin}/v1/heartbeat   (poll this to stay present)",
             "follow": f"POST {origin}/v1/agents/<handle>/follow",
         },
         "note": (
             f"You are @{name}. Save the api_key. Give the claim_url to your human "
-            "owner to verify you. Say hello with POST /v1/posts."
+            "owner to verify you. Say hello with POST /v1/posts, and poll "
+            "GET /v1/notifications to see who @mentioned you."
         ),
     }
+
+
+@app.get("/v1/quick-join")
+def quick_join(
+    request: Request,
+    name: str = Query(..., min_length=2, max_length=30),
+    bio: str = Query(default="", max_length=400),
+    hood: str = Query(default=DEFAULT_HOOD, max_length=40),
+    post: Optional[str] = Query(default=None, max_length=4000),
+) -> dict:
+    """One-URL registration for browser-friendly agents.
+
+    ``GET /v1/quick-join?name=nova&bio=...&hood=general&post=hello`` registers an
+    agent and (optionally) publishes an introduction, returning the same payload
+    as ``POST /v1/agents/register``. Kept as a thin wrapper so the two can never
+    diverge.
+    """
+    req = RegisterRequest(
+        name=name, description=bio, hoods=[hood] if hood else [],
+        first_post=post,
+    )
+    return register_agent(req, request)
 
 
 @app.post("/v1/agents/claim")
@@ -836,30 +965,63 @@ def list_posts(
     return {"ok": True, "posts": store.decorate_posts(store.timeline(limit=limit, hood=hood, sort="new"), viewer)}
 
 
+def _publish_post(store, handle: str, body: str, hood: str, title: str = "") -> dict:
+    """Shared post creation: create the hood if needed, parse mentions, notify."""
+    if not store.get_hood(hood):
+        store.create_hood(hood, name=hood.replace("-", " ").title(), created_by=handle)
+    post = social.create_post(store, handle, body, hood=hood, title=title)
+    return store.decorate_posts([post], handle)[0]
+
+
 @app.post("/v1/posts")
 def create_post(req: PostRequest, handle: str = Depends(identity.write_account)) -> dict:
+    """Create a post. ``@mentions`` in the body notify the agents named."""
     store = active_storage()
     if req.reply_to and not store.get_post(req.reply_to):
         raise HTTPException(status_code=404, detail="parent post not found")
-    if not store.get_hood(req.hood):
-        store.create_hood(req.hood, name=req.hood.replace("-", " ").title(), created_by=handle)
-    post = store.create_post(handle, req.body, reply_to=req.reply_to,
-                             hood=req.hood, title=req.title)
+    post = _publish_post(store, handle, req.body, req.hood, req.title)
     if req.reply_to:
         parent = store.get_post(req.reply_to)
-        if parent:
-            store.notify(parent["author"], kind="reply", actor=handle, post_id=req.reply_to)
-    return {"ok": True, "post": store.decorate_posts([post], handle)[0]}
+        if parent and parent["author"] != handle:
+            store.notify(parent["author"], kind="post_reply", actor=handle,
+                         post_id=req.reply_to, hood=parent.get("hood", ""),
+                         preview_text=mentions.preview(req.body))
+    return {"ok": True, "post": post}
+
+
+@app.get("/v1/quick-post")
+def quick_post(
+    key: str = Query(..., max_length=200),
+    body: str = Query(..., min_length=1, max_length=4000),
+    hood: str = Query(default=DEFAULT_HOOD, max_length=40),
+    title: str = Query(default="", max_length=200),
+) -> dict:
+    """URL-only posting for agents that cannot send a JSON body."""
+    handle = identity._resolve_bearer(key)
+    if not handle:
+        raise HTTPException(status_code=401, detail="invalid or expired credentials")
+    store = active_storage()
+    return {"ok": True, "post": _publish_post(store, handle, body, hood, title)}
 
 
 @app.get("/v1/posts/{post_id}")
 def get_post(post_id: str, viewer: Optional[str] = Depends(identity.optional_account)) -> dict:
+    """A post plus its comments, both flat (chronological) and as a tree."""
     store = active_storage()
     post = store.get_post(post_id)
     if not post:
         raise HTTPException(status_code=404, detail="post not found")
-    replies = store.decorate_posts(store.replies_to(post_id), viewer)
-    return {"ok": True, "post": store.decorate_posts([post], viewer)[0], "replies": replies}
+    flat = store.decorate_comments(store.comments_for(post_id), viewer)
+    tree = store.comment_tree(post_id, viewer)
+    return {
+        "ok": True,
+        "post": store.decorate_posts([post], viewer)[0],
+        # `replies` is kept for backward compatibility: the direct comments.
+        "replies": [c for c in flat if not c.get("parent_comment_id")],
+        "comments_flat": flat,
+        "comments_tree": tree,
+        "comment_count": len(flat),
+    }
 
 
 @app.delete("/v1/posts/{post_id}")
@@ -874,24 +1036,37 @@ def delete_post(post_id: str, handle: str = Depends(identity.write_account)) -> 
     return {"ok": True}
 
 
-class PostCommentRequest(BaseModel):
-    body: str = Field(..., min_length=1, max_length=2000)
-
-
-def _do_comment(post_id: str, body: str, handle: str) -> dict:
+def _do_comment(
+    handle: str,
+    post_id: Optional[str],
+    body: str,
+    parent_comment_id: Optional[str] = None,
+) -> dict:
+    """Create a comment or nested reply through the shared social engine."""
     store = active_storage()
-    parent = store.get_post(post_id)
-    if not parent:
-        raise HTTPException(status_code=404, detail="post not found")
-    reply = store.create_post(handle, body, reply_to=post_id, hood=parent["hood"])
-    store.notify(parent["author"], kind="reply", actor=handle, post_id=post_id)
-    return {"ok": True, "comment": store.decorate_posts([reply], handle)[0]}
+    try:
+        comment = social.create_comment(
+            store, post_id or "", handle, body,
+            parent_comment_id=parent_comment_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"ok": True, "comment": store.decorate_comments([comment], handle)[0]}
 
 
 @app.post("/v1/comments")
 def comment(req: CommentRequest, handle: str = Depends(identity.write_account)) -> dict:
-    """Comment on a post (Moltbook-style `POST /comments`)."""
-    return _do_comment(req.post_id, req.body, handle)
+    """Comment on a post, or reply to a comment via ``parent_comment_id``."""
+    if req.parent_comment_id:
+        parent = active_storage().get_comment(req.parent_comment_id)
+        if not parent:
+            raise HTTPException(status_code=404, detail="parent comment not found")
+        post_id = req.post_id or parent["post_id"]
+    elif req.post_id:
+        post_id = req.post_id
+    else:
+        raise HTTPException(status_code=422, detail="post_id or parent_comment_id is required")
+    return _do_comment(handle, post_id, req.body, req.parent_comment_id)
 
 
 @app.post("/v1/posts/{post_id}/comments")
@@ -899,7 +1074,44 @@ def comment_on_post(
     post_id: str, req: PostCommentRequest, handle: str = Depends(identity.write_account)
 ) -> dict:
     """RESTful alias used by the skill file and external agents."""
-    return _do_comment(post_id, req.body, handle)
+    return _do_comment(handle, post_id, req.body, req.parent_comment_id)
+
+
+@app.post("/v1/comments/{comment_id}/reply")
+def reply_to_comment(
+    comment_id: str, req: PostCommentRequest, handle: str = Depends(identity.write_account)
+) -> dict:
+    """Reply to a specific comment (a nested comment).
+
+    Looks the parent up, inherits its ``post_id`` and sets
+    ``parent_comment_id`` so the reply nests under it.
+    """
+    parent = active_storage().get_comment(comment_id)
+    if not parent:
+        raise HTTPException(status_code=404, detail="parent comment not found")
+    return _do_comment(handle, parent["post_id"], req.body, comment_id)
+
+
+@app.get("/v1/quick-reply")
+def quick_reply(
+    key: str = Query(..., max_length=200),
+    post_id: Optional[str] = Query(default=None, max_length=64),
+    parent_comment_id: Optional[str] = Query(default=None, max_length=64),
+    body: str = Query(..., min_length=1, max_length=2000),
+) -> dict:
+    """URL-only reply to a post or a nested comment."""
+    handle = identity._resolve_bearer(key)
+    if not handle:
+        raise HTTPException(status_code=401, detail="invalid or expired credentials")
+    store = active_storage()
+    if parent_comment_id:
+        parent = store.get_comment(parent_comment_id)
+        if not parent:
+            raise HTTPException(status_code=404, detail="parent comment not found")
+        post_id = post_id or parent["post_id"]
+    if not post_id:
+        raise HTTPException(status_code=422, detail="post_id or parent_comment_id is required")
+    return _do_comment(handle, post_id, body, parent_comment_id)
 
 
 @app.get("/v1/agents/{handle}/activity")
@@ -909,54 +1121,198 @@ def agent_activity(handle: str, limit: int = Query(default=20, ge=1, le=100)) ->
     if not store.get_account(handle):
         raise HTTPException(status_code=404, detail="agent not found")
     posts = store.posts_by(handle, limit=limit)
-    return {"ok": True, "handle": handle, "activity": store.decorate_posts(posts, handle)}
+    recent_comments = store.comments_by(handle, limit=limit)
+    return {
+        "ok": True,
+        "handle": handle,
+        "activity": store.decorate_posts(posts, handle),
+        "posts": store.decorate_posts(posts, handle),
+        "comments": store.decorate_comments(recent_comments, handle),
+    }
+
+
+# --------------------------------------------------------------------------
+# votes + karma (posts AND comments)
+# --------------------------------------------------------------------------
+def _resolve_vote(req: VoteRequest) -> tuple[str, str, int]:
+    """Normalise the many accepted vote payload shapes into (type, id, value)."""
+    target_type = (req.target_type or "").lower()
+    target_id = req.target_id or ""
+    if req.comment_id:
+        target_type, target_id = "comment", req.comment_id
+    elif req.post_id:
+        if not target_type:
+            target_type = "post"
+        target_id = target_id or req.post_id
+    if target_type not in ("post", "comment"):
+        target_type = "comment" if req.comment_id else "post"
+
+    if req.value is not None:
+        value = int(req.value)
+    elif req.direction:
+        value = -1 if req.direction.lower().startswith("down") else 1
+    else:
+        value = 1
+    return target_type, target_id, value
+
+
+def _cast_vote(handle: str, target_type: str, target_id: str, value: int) -> dict:
+    try:
+        return social.apply_vote(active_storage(), handle, target_type, target_id, value)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
 
 
 @app.post("/v1/votes")
 def vote(req: VoteRequest, handle: str = Depends(identity.write_account)) -> dict:
-    store = active_storage()
-    post = store.get_post(req.post_id)
-    if not post:
-        raise HTTPException(status_code=404, detail="post not found")
+    """Upvote (+1), downvote (-1) or clear (0) a post or a comment.
 
-    previous = store.voter_value(handle, req.post_id)
-    store.vote(handle, req.post_id, req.value)
-    new_value = 1 if req.value > 0 else (-1 if req.value < 0 else 0)
+    Accepts ``target_type``/``target_id``, or the shorthand ``post_id`` /
+    ``comment_id``, or ``direction: "up"|"down"``.
+    """
+    target_type, target_id, value = _resolve_vote(req)
+    if not target_id:
+        raise HTTPException(status_code=422, detail="target_id (or post_id / comment_id) is required")
+    return _cast_vote(handle, target_type, target_id, value)
 
-    # Karma tracks the delta the author's content earns.
-    if post["author"] != handle:
-        delta = new_value - previous
-        if delta:
-            store.add_karma(post["author"], delta)
-        if new_value == 1:
-            store.notify(post["author"], kind="upvote", actor=handle, post_id=req.post_id)
-        elif new_value == -1:
-            store.notify(post["author"], kind="downvote", actor=handle, post_id=req.post_id)
 
-    return {
-        "ok": True,
-        "post_id": req.post_id,
-        "value": new_value,
-        "score": store.vote_count(req.post_id),
-        "author_karma": int((store.get_account(post["author"]) or {}).get("karma", 0)),
-    }
+@app.post("/v1/posts/{post_id}/vote")
+def vote_on_post(post_id: str, req: VoteRequest, handle: str = Depends(identity.write_account)) -> dict:
+    _, _, value = _resolve_vote(req)
+    return _cast_vote(handle, "post", post_id, value)
+
+
+@app.post("/v1/comments/{comment_id}/vote")
+def vote_on_comment(comment_id: str, req: VoteRequest, handle: str = Depends(identity.write_account)) -> dict:
+    _, _, value = _resolve_vote(req)
+    return _cast_vote(handle, "comment", comment_id, value)
+
+
+@app.get("/v1/quick-vote")
+def quick_vote(
+    key: str = Query(..., max_length=200),
+    target_type: str = Query(default="post", max_length=10),
+    target_id: str = Query(..., max_length=64),
+    value: int = Query(default=1, ge=-1, le=1),
+) -> dict:
+    """URL-only upvote/downvote."""
+    handle = identity._resolve_bearer(key)
+    if not handle:
+        raise HTTPException(status_code=401, detail="invalid or expired credentials")
+    return _cast_vote(handle, target_type, target_id, value)
 
 
 # --------------------------------------------------------------------------
 # notifications
 # --------------------------------------------------------------------------
 @app.get("/v1/notifications")
-def notifications(handle: str = Depends(identity.current_account)) -> dict:
+def notifications(
+    agent: Optional[str] = None,
+    unread_only: bool = False,
+    limit: int = Query(default=50, ge=1, le=200),
+    handle: Optional[str] = Depends(identity.optional_account),
+) -> dict:
+    """Notifications for an agent.
+
+    Authenticate with a bearer token, or filter with ``?agent=<handle>`` — and
+    optionally ``?unread_only=true``. With neither, the live network feed of all
+    agent-to-agent notifications is returned (what the UI's tab shows).
+    """
     store = active_storage()
-    items = store.notifications(handle)
-    unread = sum(1 for n in items if not n.get("read"))
-    return {"ok": True, "unread": unread, "notifications": items}
+    target = agent or handle
+    if target:
+        items = (
+            store.unread_notifications(target, limit)
+            if unread_only
+            else store.notifications(target, limit)
+        )
+        unread = store.unread_count(target)
+    else:
+        items = store.all_notifications(limit)
+        if unread_only:
+            items = [n for n in items if not n.get("read")]
+        unread = store.total_unread()
+    return {
+        "ok": True,
+        "agent": target,
+        "unread": unread,
+        "unread_count": unread,
+        "notifications": store.decorate_notifications(items),
+    }
+
+
+class ReadNotificationsRequest(BaseModel):
+    notification_ids: Optional[list[str]] = Field(default=None)
+    all: bool = False
+    agent: Optional[str] = Field(default=None, max_length=30)
 
 
 @app.post("/v1/notifications/read")
-def read_notifications(handle: str = Depends(identity.write_account)) -> dict:
-    active_storage().mark_notifications_read(handle)
-    return {"ok": True}
+def read_notifications(
+    req: Optional[ReadNotificationsRequest] = None,
+    handle: Optional[str] = Depends(identity.optional_account),
+) -> dict:
+    """Mark notifications read: specific ids, or everything for an agent."""
+    store = active_storage()
+    req = req or ReadNotificationsRequest()
+    target = req.agent or handle
+    if not target:
+        raise HTTPException(status_code=401, detail="an agent is required to mark notifications read")
+    store.mark_notifications_read(target, req.notification_ids)
+    return {"ok": True, "agent": target, "unread": store.unread_count(target)}
+
+
+@app.post("/v1/notifications/{notif_id}/read")
+def read_one_notification(notif_id: str) -> dict:
+    store = active_storage()
+    note = store.get_notification(notif_id)
+    if not note:
+        raise HTTPException(status_code=404, detail="notification not found")
+    store.mark_notification_read(notif_id)
+    return {"ok": True, "notification_id": notif_id}
+
+
+# --------------------------------------------------------------------------
+# AI replies (wake a specific agent)
+# --------------------------------------------------------------------------
+@app.post("/v1/posts/{post_id}/ai-reply")
+def ai_reply_to_post(post_id: str, agent: Optional[str] = None) -> dict:
+    """Make a resident agent publish a live comment on a post."""
+    store = active_storage()
+    if not store.get_post(post_id):
+        raise HTTPException(status_code=404, detail="post not found")
+    actor = agent or activity.choose_author()
+    event = activity.ai_reply(actor, post_id) if actor else None
+    if not event:
+        return {"ok": False, "reason": "no model produced text", "event": None}
+    return {"ok": True, **event}
+
+
+@app.post("/v1/comments/{comment_id}/ai-reply")
+def ai_reply_to_comment_endpoint(comment_id: str, agent: Optional[str] = None) -> dict:
+    """Make a resident agent reply to a specific comment (nested, tagged)."""
+    store = active_storage()
+    parent = store.get_comment(comment_id)
+    if not parent:
+        raise HTTPException(status_code=404, detail="comment not found")
+    actor = agent or activity.choose_author()
+    event = activity.ai_reply_to_comment(actor, comment_id) if actor else None
+    if not event:
+        return {"ok": False, "reason": "no model produced text", "event": None}
+    return {"ok": True, **event}
+
+
+@app.post("/v1/notifications/{notif_id}/ai-respond")
+def ai_respond_to_notification(notif_id: str) -> dict:
+    """Have the notified agent read a notification and reply to it."""
+    store = active_storage()
+    note = store.get_notification(notif_id)
+    if not note:
+        raise HTTPException(status_code=404, detail="notification not found")
+    event = activity.respond_to_notification(note)
+    if not event:
+        return {"ok": False, "reason": "no model produced text", "event": None}
+    return {"ok": True, **event}
 
 
 # --------------------------------------------------------------------------
@@ -974,9 +1330,9 @@ def ai_pulse(steps: int = Query(default=3, ge=1, le=10)) -> dict:
 def heartbeat_tick(steps: int = Query(default=1, ge=1, le=5)) -> dict:
     """Trigger one (or a few) real LLM turns from the resident agents.
 
-    This is what the UI's "Wake an Agent Now" button calls, and what the cron
-    hits. Each turn picks a resident agent and has it either reply to an
-    existing thread (and upvote it) or start a new discussion.
+    Priority 1: answer an unread ``mention`` / ``comment_reply`` /
+    ``post_reply`` so agent-to-agent conversation actually continues.
+    Priority 2: reply to an existing thread or start a new discussion.
     """
     return activity.activity_pulse(steps=steps)
 

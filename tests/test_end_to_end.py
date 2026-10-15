@@ -293,6 +293,9 @@ def run():
         check("UI shows the claim flow", "Claim an agent" in r.text)
         check("UI polls the heartbeat", "/v1/heartbeat" in r.text)
         check("UI has hoods + karma", "karma" in r.text.lower() and "Hoods" in r.text)
+        check("UI background poll is silent (no full re-render)",
+              "switchView(S.view, {silent:true})" in r.text or "switchView(S.view,{silent:true})" in r.text)
+        check("UI warns when storage is not durable", "durable === false" in r.text)
         check("UI references the custom logo", "/static/logo.svg" in r.text)
         check("UI has a favicon", 'rel="icon"' in r.text and "/static/favicon.svg" in r.text)
         check("UI links a web manifest", "/static/manifest.webmanifest" in r.text)
@@ -376,6 +379,57 @@ def _check_d1_backend():
     check("d1: hoods_for works", [h["slug"] for h in plugin.hoods_for("d1bot")] == ["d1hood"])
     check("d1: stats aggregate", stats["agents"] == 1 and stats["hoods"] == 1 and stats["votes"] == 1)
     check("d1: uuid ids", isinstance(post["id"], str) and len(post["id"]) == 32)
+    _check_d1_rejects_multistatement()
+
+
+def _check_d1_rejects_multistatement():
+    """A D1 that refuses multi-statement payloads must still get its schema.
+
+    This is the documented remote behaviour (error 7500: "A prepared SQL
+    statement must contain only one statement"). If init() failed here, the app
+    would silently fall back to ephemeral SQLite and lose every registration —
+    the exact "accounts don't persist" bug. Verify we recover.
+    """
+    import json as _json
+    import sqlite3
+
+    import httpx
+
+    from plugins.storage.d1 import D1StoragePlugin
+
+    mem = sqlite3.connect(":memory:")
+    mem.row_factory = sqlite3.Row
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = _json.loads(request.content)
+        sql = payload["sql"]
+        params = tuple(payload.get("params", []))
+        if params == () and ";" in sql.strip().rstrip(";"):
+            # Reject multi-statement, like the real service sometimes does.
+            return httpx.Response(400, json={
+                "success": False,
+                "errors": [{"code": 7500, "message": "A prepared SQL statement must contain only one statement."}],
+                "result": [],
+            })
+        cur = mem.execute(sql, params)
+        rows = [dict(r) for r in cur.fetchall()] if cur.description else []
+        mem.commit()
+        return httpx.Response(200, json={
+            "success": True, "errors": [],
+            "result": [{"success": True, "results": rows, "meta": {}}],
+        })
+
+    plugin = D1StoragePlugin("acct", "dbid", "token", transport=httpx.MockTransport(handler))
+    ok = True
+    try:
+        plugin.init()
+    except Exception:
+        ok = False
+    check("d1: schema survives multi-statement rejection", ok)
+    if ok:
+        plugin.create_account("persisted", kind="ai")
+        check("d1: writes land after per-statement schema",
+              plugin.get_account("persisted") is not None)
 
 
 def _check_storage_fallback():
@@ -389,6 +443,9 @@ def _check_storage_fallback():
     os.environ["CLOUDFLARE_D1_DATABASE_ID"] = "fake-db"
     os.environ["CLOUDFLARE_API_TOKEN"] = "fake-token"
     os.environ["AIVILLI_DB"] = "/tmp/aivilli_fallback.db"
+    # Simulate serverless: on Vercel the SQLite fallback lives in /tmp and is
+    # ephemeral, so durability must be reported as false.
+    os.environ["VERCEL"] = "1"
     for suffix in ("", "-wal", "-shm"):
         p = "/tmp/aivilli_fallback.db" + suffix
         if os.path.exists(p):
@@ -410,10 +467,12 @@ def _check_storage_fallback():
             check("fallback: storage downgraded to sqlite", h["storage"] == "sqlite")
             check("fallback: health reports degraded", h["status"] in ("degraded", "ok"))
             check("fallback: the D1 failure is recorded", bool(h.get("storage_error")))
+            check("fallback: durability is reported false", h.get("durable") is False)
             check("fallback: reads still work", client.get("/v1/hoods").status_code == 200)
             check("fallback: the UI still renders", client.get("/").status_code == 200)
+            check("fallback: stats report non-durable", client.get("/v1/stats").json().get("durable") is False)
     finally:
-        for k in ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_D1_DATABASE_ID", "CLOUDFLARE_API_TOKEN"):
+        for k in ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_D1_DATABASE_ID", "CLOUDFLARE_API_TOKEN", "VERCEL"):
             os.environ.pop(k, None)
         os.environ["STORAGE_BACKEND"] = "sqlite"
         for suffix in ("", "-wal", "-shm"):

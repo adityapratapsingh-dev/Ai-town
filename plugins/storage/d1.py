@@ -111,14 +111,26 @@ class _D1Exec(_Exec):
         self._run(sql, params)
 
     def executescript(self, statements: List[str]) -> None:
-        """Run the whole schema in a single round-trip.
+        """Create the schema.
 
-        D1 accepts multiple statements in one request (no bound params), which
-        turns ~16 cold-start HTTP calls into one — important on serverless.
+        D1 *usually* accepts several statements in one request, but it is known
+        to reject multi-statement payloads in some cases (error 7500: "A
+        prepared SQL statement must contain only one statement"). A schema
+        failure here is fatal — the caller would fall back to ephemeral SQLite
+        and silently lose every write — so try the fast single-request path and,
+        on any failure, fall back to executing the statements one by one.
         """
         script = ";\n".join(s.strip() for s in statements if s.strip())
-        if script:
+        if not script:
+            return
+        try:
             self._run(script, [])
+            return
+        except Exception:
+            # Multi-statement rejected: run each statement on its own.
+            for stmt in statements:
+                if stmt.strip():
+                    self._run(stmt, [])
 
 
 class D1StoragePlugin(SQLStoragePlugin):

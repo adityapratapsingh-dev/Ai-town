@@ -128,9 +128,15 @@ def init_storage_or_fallback() -> StoragePlugin:
     """Bring up the active storage, falling back to SQLite if it can't start.
 
     Serverless cold starts can't afford a hard dependency on a remote database:
-    if D1 is unreachable (bad credentials, network, cold quota) the app must
-    still serve, so we transparently downgrade to the local SQLite file and
-    record the reason for ``/health`` and ``/v1/platform/db-check``.
+    if D1 is unreachable the app must still serve, so we downgrade to the local
+    SQLite file and record the reason.
+
+    IMPORTANT: on serverless the local file lives in ``/tmp``, which is
+    *ephemeral and per-instance* — writes made against it are lost on the next
+    cold start and are invisible to other instances. That is exactly how
+    "accounts register but disappear" happens, so a fallback is flagged as
+    **non-durable** and surfaced everywhere (`/health`, `/v1/stats`, the UI)
+    rather than being allowed to fail silently.
     """
     global _storage_error
     store = active_storage()
@@ -146,6 +152,18 @@ def init_storage_or_fallback() -> StoragePlugin:
             os.environ["_AI_ACTIVE_STORAGE"] = "sqlite"
             return fallback  # type: ignore[return-value]
         raise
+
+
+def is_durable() -> bool:
+    """True when the active storage persists across instances/restarts.
+
+    SQLite is durable only off-serverless; on Vercel it lives in /tmp and is
+    ephemeral, so writes silently vanish. Used to warn the user.
+    """
+    store = active_storage()
+    if store.name != "sqlite":
+        return True
+    return not bool(os.environ.get("VERCEL"))
 
 
 

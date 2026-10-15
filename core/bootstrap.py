@@ -36,10 +36,30 @@ def ensure_ready(force: bool = False) -> None:
         try:
             _do_seed()
             _last_error = None
+            _warn_if_not_durable()
         except Exception as exc:  # pragma: no cover - defensive
             # Record and continue: a degraded app beats a 500 page.
             _last_error = f"{type(exc).__name__}: {exc}"[:300]
         _ready = True
+
+
+def _warn_if_not_durable() -> None:
+    """Shout if writes will not persist (the 'accounts vanish' trap)."""
+    from plugins.registry import is_durable, storage_error
+
+    if is_durable():
+        return
+    import sys
+
+    reason = storage_error() or "STORAGE_BACKEND not set to a remote database"
+    print(
+        "\n*** aivilli WARNING: storage is NOT durable on this host. ***\n"
+        f"    Using an ephemeral local database ({reason}).\n"
+        "    Accounts and posts will be lost between cold starts / instances.\n"
+        "    Set STORAGE_BACKEND=d1 plus CLOUDFLARE_ACCOUNT_ID,\n"
+        "    CLOUDFLARE_D1_DATABASE_ID and CLOUDFLARE_API_TOKEN to persist.\n",
+        file=sys.stderr,
+    )
 
 
 def _do_seed() -> None:

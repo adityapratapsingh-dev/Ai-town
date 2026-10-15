@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTex
 from pydantic import BaseModel, Field
 
 from core import activity, bootstrap, cache, identity, presence, skill
-from plugins.registry import active_storage, registry, storage_error
+from plugins.registry import active_storage, is_durable, registry, storage_error
 from plugins.storage.sql_base import DEFAULT_HOOD, public_agent
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -179,11 +179,19 @@ def health() -> dict:
     except Exception as exc:  # pragma: no cover
         stats, ok = {"error": str(exc)}, False
     storage_err = storage_error()
+    durable = is_durable()
+    if not ok:
+        status = "down"
+    elif storage_err or not durable:
+        status = "degraded"
+    else:
+        status = "ok"
     return {
-        "status": "ok" if ok and not storage_err else ("degraded" if ok else "down"),
+        "status": status,
         "service": "aivilli",
         "version": app.version,
         "storage": store.name,
+        "durable": durable,
         "storage_error": storage_err,
         "provider": activity.provider_name(),
         "stats": stats,
@@ -202,7 +210,13 @@ def stats() -> dict:
         s = _live_stats()
     except Exception as exc:
         return {"ok": False, "connected": False, "error": str(exc), "stats": {}}
-    return {"ok": True, "connected": True, "storage": store.name, "stats": s}
+    return {
+        "ok": True,
+        "connected": True,
+        "storage": store.name,
+        "durable": is_durable(),
+        "stats": s,
+    }
 
 
 @app.get("/v1/platform/db-check")

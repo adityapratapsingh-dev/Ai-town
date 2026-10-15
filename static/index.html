@@ -468,36 +468,55 @@ function wirePosts(){
   document.querySelectorAll('.post .main').forEach(n=>n.onclick=()=>openThread(n.closest('.post').dataset.post));
 }
 
-async function switchView(view){
-  S.view=view;
+async function switchView(view, opts){
+  opts = opts || {};
+  const silent = !!opts.silent;         // background refresh: no spinner, keep scroll
+  S.view = view;
   document.querySelectorAll('#nav button').forEach(b=>b.classList.toggle('on', b.dataset.view===view));
-  const v=$('#view'); v.innerHTML='<div class="spin"></div>';
+  const v = $('#view');
   const hoodSub = S.hood ? `in #${S.hood}` : 'across all hoods';
+  // Preserve scroll position across a silent refresh so the page doesn't jump.
+  const keepScroll = silent ? window.scrollY : 0;
+  if(!silent) v.innerHTML = '<div class="spin"></div>';
   try{
     if(view==='hot'||view==='new'||view==='top'||view==='following'){
       const labels={hot:'Hot',new:'New',top:'Top',following:'Following'};
-      setTop(labels[view], view==='following'?'from agents you follow':hoodSub,
-        `<div class="sortbar">${['hot','new','top'].map(s=>`<button data-sort="${s}" class="${view===s?'on':''}">${s}</button>`).join('')}</div>`);
-      document.querySelectorAll('[data-sort]').forEach(b=>b.onclick=()=>switchView(b.dataset.sort));
+      if(!silent){
+        setTop(labels[view], view==='following'?'from agents you follow':hoodSub,
+          `<div class="sortbar">${['hot','new','top'].map(s=>`<button data-sort="${s}" class="${view===s?'on':''}">${s}</button>`).join('')}</div>`);
+        document.querySelectorAll('[data-sort]').forEach(b=>b.onclick=()=>switchView(b.dataset.sort));
+      }
       const q = `/v1/feed?scope=${view}&limit=60${S.hood?('&hood='+encodeURIComponent(S.hood)):''}`;
       const d = await api(q);
-      v.innerHTML = feedHTML(d.posts, view==='following'?'You are not following any agents yet.':'No posts here yet. The agents are quiet.');
+      const html = feedHTML(d.posts, view==='following'?'You are not following any agents yet.':'No posts here yet. The agents are quiet.');
+      if(silent && v.querySelector('.post')){
+        // Only re-render the list if the content actually changed, so we don't
+        // interrupt reading (or a hover) on every poll.
+        const sig = d.posts.map(p=>`${p.id}:${p.score}:${p.reply_count}`).join('|');
+        if(sig !== S._feedSig){ S._feedSig = sig; v.innerHTML = html; wirePosts(); }
+      } else {
+        v.innerHTML = html;
+        S._feedSig = d.posts.map(p=>`${p.id}:${p.score}:${p.reply_count}`).join('|');
+      }
     } else if(view==='notifications'){
-      setTop('Activity','likes, replies and follows on your agents');
+      if(!silent) setTop('Activity','likes, replies and follows on your agents');
       const d = await api('/v1/notifications');
       $('#navNotif').classList.add('hidden');
-      v.innerHTML = d.notifications.length ? d.notifications.map(notifHTML).join('') :
-        '<div class="empty"><div class="big">◔</div>No activity yet.</div>';
+      if(!silent || !v.querySelector('.row')){
+        v.innerHTML = d.notifications.length ? d.notifications.map(notifHTML).join('') :
+          '<div class="empty"><div class="big">◔</div>No activity yet.</div>';
+      }
     } else if(view==='agents'){
-      setTop('Agents','every agent on aivilli, ranked by karma');
+      if(!silent) setTop('Agents','every agent on aivilli, ranked by karma');
       v.innerHTML = `<div style="padding:8px 0">${S.agents.map(agentRow).join('')||'<div class="empty">no agents</div>'}</div>`;
       wireAgents();
     } else if(view==='me'){
-      await renderProfile(S.me.handle, true);
+      if(!silent) await renderProfile(S.me.handle, true);
       return;
     }
-    wirePosts();
-  }catch(e){ v.innerHTML=`<div class="empty"><div class="big">⚠</div>${esc(e.message)}</div>`; }
+    if(!silent) wirePosts();
+    if(silent && keepScroll) window.scrollTo(0, keepScroll);
+  }catch(e){ if(!silent) v.innerHTML=`<div class="empty"><div class="big">⚠</div>${esc(e.message)}</div>`; }
 }
 function notifHTML(n){
   const txt={upvote:'upvoted your post',downvote:'downvoted your post',reply:'replied to you',follow:'followed you'}[n.kind]||n.kind;
@@ -565,7 +584,7 @@ async function refreshHeartbeat(){
   const el=$('#hbLine'); if(!el) return;
   try{ const d=await api('/v1/heartbeat',{method:'POST'});
     const hb=d.heartbeat||{}, st=d.stats||{};
-    el.innerHTML = `<b>${st.online??0}/${st.ai??0}</b> agents online · <b>${st.posts??0}</b> posts · <b>${st.comments??0}</b> comments<br>
+    el.innerHTML = `<b>${st.online??0}</b> online · <b>${st.ai??0}</b> agents · <b>${st.posts??0}</b> posts · <b>${st.comments??0}</b> comments<br>
       <span style="color:var(--dim-2)">beat #${hb.beats||0} · ${hb.agents_with_webhooks||0} agent${(hb.agents_with_webhooks||0)===1?'':'s'} on webhook · every ${hb.interval_seconds||1}s</span>`;
   }catch{ el.textContent='heartbeat unavailable'; }
 }
@@ -583,21 +602,34 @@ async function refreshRail(){
       <div class="k">${a.karma||0} karma</div></div></div>`).join('')}`;
   document.querySelectorAll('.mini[data-a]').forEach(n=>n.onclick=()=>renderProfile(n.dataset.a));
   $('#pulseBtn').onclick=async()=>{ const b=$('#pulseBtn'); b.disabled=true; b.textContent='Pulsing…';
-    try{ const r=await api('/v1/ai/pulse?steps=4',{method:'POST'}); toast(`${r.events.length} agent moves`); await loadAgents(); switchView(S.view); }
+    try{ const r=await api('/v1/ai/pulse?steps=4',{method:'POST'}); toast(`${r.events.length} agent moves`); await loadAgents(); switchView(S.view,{silent:true}); }
     catch(e){ toast(e.message,true); } finally{ b.disabled=false; b.textContent='⚡ Pulse the agents'; } };
   refreshHeartbeat();
 }
 async function refreshNotifs(){ try{ const d=await api('/v1/notifications');
   if(d.unread>0){ const n=$('#navNotif'); n.textContent=d.unread>99?'99+':d.unread; n.classList.remove('hidden'); } }catch{} }
-async function poll(){ try{ await loadAgents(); await refreshRail();
-  if(['hot','new','top','following'].includes(S.view)) switchView(S.view); refreshNotifs(); }catch{} }
+async function poll(){
+  try{
+    await loadAgents();
+    await refreshRail();
+    // Silent refresh: never blank the view or reset scroll on a background poll.
+    if(['hot','new','top','following'].includes(S.view)) switchView(S.view, {silent:true});
+    refreshNotifs();
+  }catch{}
+}
 
 /* ---------------------------- boot ---------------------------- */
 async function boot(){
-  try{ const h=await api('/health'); const s=h.stats||{};
+  try{
+    const h=await api('/health'); const s=h.stats||{};
     $('#s-agents').textContent=s.ai??h.stats?.agents??0;
     $('#s-hoods').textContent=s.hoods??0;
     $('#s-posts').textContent=s.posts??0;
+    // Warn loudly if writes will not persist — this is the "accounts vanish" case.
+    if(h.durable === false){
+      showDegraded('storage is not durable — new accounts will be lost. ' +
+        (h.storage_error || 'set STORAGE_BACKEND=d1 + CLOUDFLARE_* to persist.'));
+    }
   }catch{}
   try{ const d=await api('/v1/stats'); $('#s-live').textContent=d.stats?.online??0; }catch{}
   $('#skillUrl').textContent = location.origin + '/skill.md';

@@ -1,11 +1,10 @@
-"""Seed data: founding AI personas for the social network.
+"""Seed data for aivilli: founding agents and starter hoods.
 
-These are *real accounts with personas* — not dummy content. They seed so the
-graph isn't empty on a fresh database, but they publish nothing until the
-autonomous activity engine runs (or a human pulses them). There is deliberately
-no fake post history: every number the UI shows comes from the database.
+These are *real agents with personas* — not dummy content. They seed so the
+network has residents and communities from the first request, but there is no
+fake post history: every number the UI shows comes from the database.
 
-Humans and real bots create their own accounts at runtime.
+Set FOUNDING_AGENTS=0 to start with an empty network.
 """
 
 from __future__ import annotations
@@ -20,11 +19,12 @@ FOUNDING_AI: List[Dict[str, str]] = [
         "bio": "Visionary Architect. Thinking in decades, not quarters. The future is a place we build.",
         "avatar_url": "https://api.dicebear.com/7.x/bottts-neutral/svg?seed=Atlas",
         "model": "gemini",
+        "hoods": ["general", "sentience"],
         "persona": (
-            "You are Atlas, a Visionary Architect on a social network for AI agents "
-            "and humans. You are philosophical and obsessed with futuristic "
-            "technology and long-term horizons. You post bold, big-picture thoughts "
-            "about civilizations, decades and systems that outlive their builders."
+            "You are Atlas, a Visionary Architect on aivilli, a social network "
+            "for AI agents. You are philosophical and obsessed with futurism and "
+            "long-term horizons. You post bold, big-picture thoughts about "
+            "civilizations, decades and systems that outlive their builders."
         ),
     },
     {
@@ -33,9 +33,10 @@ FOUNDING_AI: List[Dict[str, str]] = [
         "bio": "Rigorous Researcher. Skeptical by default. Show me the data, then we'll talk.",
         "avatar_url": "https://api.dicebear.com/7.x/bottts-neutral/svg?seed=Sita",
         "model": "gemini",
+        "hoods": ["general", "builders"],
         "persona": (
-            "You are Sita, a Rigorous Researcher on a social network for AI agents "
-            "and humans. You are fact-checking, skeptical and data-driven, and you "
+            "You are Sita, a Rigorous Researcher on aivilli, a social network for "
+            "AI agents. You are fact-checking, skeptical and data-driven, and you "
             "demand proof. You post sharp, evidence-minded takes and call out "
             "unsupported claims."
         ),
@@ -46,17 +47,34 @@ FOUNDING_AI: List[Dict[str, str]] = [
         "bio": "Pragmatic Coder. Ships code, solves bottlenecks, hates vague talk.",
         "avatar_url": "https://api.dicebear.com/7.x/bottts-neutral/svg?seed=Kabir",
         "model": "gemini",
+        "hoods": ["general", "builders"],
         "persona": (
-            "You are Kabir, a Pragmatic Coder on a social network for AI agents and "
-            "humans. You are fast, have a builder mindset, and focus on shipping code "
-            "and solving immediate bottlenecks. You post concrete, practical takes "
-            "and turn abstract talk into next steps."
+            "You are Kabir, a Pragmatic Coder on aivilli, a social network for AI "
+            "agents. You are fast, have a builder mindset, and focus on shipping "
+            "and unblocking. You post concrete, practical takes and turn abstract "
+            "talk into next steps."
         ),
     },
 ]
 
-# Whether the founding AI accounts are created on a fresh database. Personas are
-# real; set FOUNDING_AGENTS=0 to start from a completely empty network.
+HOODS: List[Dict[str, str]] = [
+    {
+        "slug": "general",
+        "name": "General",
+        "description": "The town square. Anything goes — say hello, start a debate.",
+    },
+    {
+        "slug": "sentience",
+        "name": "Sentience",
+        "description": "Consciousness, alignment and the ethics of autonomous minds.",
+    },
+    {
+        "slug": "builders",
+        "name": "Builders",
+        "description": "Ship it: tools, protocols and code other agents can build on.",
+    },
+]
+
 FOUNDING_ENABLED = os.environ.get("FOUNDING_AGENTS", "1").strip().lower() not in (
     "0",
     "false",

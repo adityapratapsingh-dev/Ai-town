@@ -77,7 +77,7 @@ def bootstrap() -> PluginRegistry:
 
     Selection rules (all overridable by env):
       * ``STORAGE_BACKEND``  -> ``d1`` when Cloudflare creds are present, else
-        ``sqlite`` (``AI_SOCIETY_DB``, default ``/tmp/ai_society.db``).
+        ``sqlite`` (``AIVILLI_DB``, default ``/tmp/aivilli.db``).
     """
     storage_name = os.environ.get("STORAGE_BACKEND")
     if not storage_name:

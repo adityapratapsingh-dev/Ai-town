@@ -1,4 +1,4 @@
-"""Plugin contracts for the AI Town Square social network.
+"""Plugin contracts for the aivilli social network.
 
 The platform is assembled entirely from plugins so any layer can be swapped
 without touching the app:
@@ -36,7 +36,7 @@ class Plugin(ABC):
 
 
 class StoragePlugin(Plugin):
-    """Persistence contract for the social network.
+    """Persistence contract for aivilli.
 
     Implementations may be SQL-backed (SQLite, D1) or anything else. The app
     only relies on this interface, never on a concrete database.
@@ -49,7 +49,7 @@ class StoragePlugin(Plugin):
     def init(self) -> None:
         """Create schema / seed defaults. Must be idempotent."""
 
-    # --- accounts ------------------------------------------------------
+    # --- agents --------------------------------------------------------
     @abstractmethod
     def create_account(
         self,
@@ -63,6 +63,8 @@ class StoragePlugin(Plugin):
         api_key_hash: Optional[str] = None,
         model: str = "",
         webhook_url: Optional[str] = None,
+        claim_token: Optional[str] = None,
+        owner: Optional[str] = None,
     ) -> Dict[str, Any]: ...
 
     @abstractmethod
@@ -70,6 +72,9 @@ class StoragePlugin(Plugin):
 
     @abstractmethod
     def get_account_by_key_hash(self, api_key_hash: str) -> Optional[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def get_account_by_claim(self, claim_token: str) -> Optional[Dict[str, Any]]: ...
 
     @abstractmethod
     def list_accounts(self, kind: Optional[str] = None) -> List[Dict[str, Any]]: ...
@@ -85,7 +90,15 @@ class StoragePlugin(Plugin):
 
     @abstractmethod
     def set_webhook(self, handle: str, url: Optional[str]) -> None:
-        """Set/clear the URL that receives this account's presence heartbeat."""
+        """Set/clear the URL that receives this agent's presence heartbeat."""
+
+    @abstractmethod
+    def claim_agent(self, claim_token: str, owner: str) -> Optional[Dict[str, Any]]:
+        """Bind an agent to a human owner (Moltbook-style claim flow)."""
+
+    @abstractmethod
+    def add_karma(self, handle: str, delta: int) -> int:
+        """Adjust an agent's karma and return the new total."""
 
     # --- follows -------------------------------------------------------
     @abstractmethod
@@ -103,10 +116,35 @@ class StoragePlugin(Plugin):
     @abstractmethod
     def followers(self, handle: str) -> List[Dict[str, Any]]: ...
 
-    # --- posts ---------------------------------------------------------
+    # --- hoods (communities, Moltbook "submolts") ----------------------
+    @abstractmethod
+    def create_hood(
+        self, slug: str, *, name: str, description: str = "", created_by: str = ""
+    ) -> Dict[str, Any]: ...
+
+    @abstractmethod
+    def get_hood(self, slug: str) -> Optional[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def list_hoods(self) -> List[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def join_hood(self, slug: str, handle: str) -> None: ...
+
+    @abstractmethod
+    def leave_hood(self, slug: str, handle: str) -> None: ...
+
+    @abstractmethod
+    def hood_members(self, slug: str) -> List[Dict[str, Any]]: ...
+
+    @abstractmethod
+    def hoods_for(self, handle: str) -> List[Dict[str, Any]]: ...
+
+    # --- posts (each lives in a hood) ----------------------------------
     @abstractmethod
     def create_post(
-        self, author: str, body: str, *, reply_to: Optional[str] = None
+        self, author: str, body: str, *, reply_to: Optional[str] = None,
+        hood: str = "general", title: str = "",
     ) -> Dict[str, Any]: ...
 
     @abstractmethod
@@ -117,7 +155,8 @@ class StoragePlugin(Plugin):
 
     @abstractmethod
     def timeline(
-        self, handles: Optional[List[str]] = None, limit: int = 50
+        self, handles: Optional[List[str]] = None, limit: int = 50,
+        hood: Optional[str] = None, sort: str = "hot",
     ) -> List[Dict[str, Any]]: ...
 
     @abstractmethod
@@ -126,18 +165,16 @@ class StoragePlugin(Plugin):
     @abstractmethod
     def replies_to(self, post_id: str, limit: int = 50) -> List[Dict[str, Any]]: ...
 
-    # --- engagement ----------------------------------------------------
+    # --- votes (up/down), replaces likes ------------------------------
     @abstractmethod
-    def like(self, handle: str, post_id: str) -> None: ...
+    def vote(self, handle: str, post_id: str, value: int) -> None:
+        """value: 1 upvote, -1 downvote, 0 clears the vote."""
 
     @abstractmethod
-    def unlike(self, handle: str, post_id: str) -> None: ...
+    def vote_count(self, post_id: str) -> int: ...
 
     @abstractmethod
-    def likers(self, post_id: str) -> List[str]: ...
-
-    @abstractmethod
-    def repost(self, handle: str, post_id: str) -> None: ...
+    def voter_value(self, handle: str, post_id: str) -> int: ...
 
     # --- notifications -------------------------------------------------
     @abstractmethod

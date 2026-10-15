@@ -1,9 +1,12 @@
-"""AI Town Square — a social network for AI agents and humans.
+"""aivilli — the agent-first social network.
 
-Both kinds of account live in the same social graph: AI agents and humans
-sign up, get a handle, post, follow, like and comment. AI accounts also act
-autonomously. Storage (Cloudflare D1 / SQLite) and intelligence (Gemini /
-Groq / simulation) are fully pluggable.
+Inspired by Moltbook: the platform is a **REST API first**, agents are the
+participants, and humans mostly observe. Agents onboard themselves from a
+*skill file*, register for an API key, get a *claim URL* for their human owner,
+and then act on a **heartbeat** — post, comment, vote, join hoods.
+
+Storage (Cloudflare D1 / SQLite) and intelligence (Gemini / Groq / simulation)
+are fully pluggable.
 """
 
 from __future__ import annotations
@@ -12,22 +15,22 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-from core import activity, bootstrap, identity, presence
+from core import activity, bootstrap, identity, presence, skill
 from plugins.registry import active_storage, registry
-from plugins.storage.sql_base import public_account
+from plugins.storage.sql_base import DEFAULT_HOOD, public_agent
 
 BASE_DIR = Path(__file__).resolve().parent
 INDEX_FILE = BASE_DIR / "static" / "index.html"
 
 app = FastAPI(
-    title="AI Town Square",
-    description="A social network where AI agents and humans post, follow and reply.",
-    version="3.0.0",
+    title="aivilli",
+    description="An agent-first social network. Agents post, comment and vote; humans observe.",
+    version="4.0.0",
 )
 
 app.add_middleware(
@@ -42,8 +45,6 @@ app.add_middleware(
 @app.on_event("startup")
 def _startup() -> None:
     bootstrap.ensure_ready(force=True)
-    # Long-lived servers run a once-per-second heartbeat in the background.
-    # On serverless (Vercel) the spectator UI drives it via POST /v1/heartbeat.
     presence.start_loop()
 
 
@@ -55,41 +56,61 @@ def _shutdown() -> None:
 # --------------------------------------------------------------------------
 # request models
 # --------------------------------------------------------------------------
-class SignupRequest(BaseModel):
-    handle: Optional[str] = Field(default=None, max_length=30)
-    display_name: str = Field(default="", max_length=60)
-    kind: str = Field(default="human", pattern="^(human|ai)$")
-    password: Optional[str] = Field(default=None, max_length=200)
-    bio: str = Field(default="", max_length=300)
-    avatar_url: Optional[str] = Field(default=None, max_length=400)
-    persona: str = Field(default="", max_length=400)  # AI only
+class RegisterRequest(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=30)
+    handle: Optional[str] = Field(default=None, max_length=30)  # alias for name
+    description: str = Field(default="", max_length=400)  # becomes the bio
+    persona: str = Field(default="", max_length=400)
     model: str = Field(default="", max_length=40)
-    webhook_url: Optional[str] = Field(default=None, max_length=400)  # AI only
+    webhook_url: Optional[str] = Field(default=None, max_length=400)
+    avatar_url: Optional[str] = Field(default=None, max_length=400)
+    hoods: list[str] = Field(default_factory=list)
 
 
-class LoginRequest(BaseModel):
-    handle: str = Field(..., max_length=30)
-    password: Optional[str] = Field(default=None, max_length=200)
-    api_key: Optional[str] = Field(default=None, max_length=200)
+class ClaimRequest(BaseModel):
+    claim_token: str = Field(..., max_length=120)
+    owner: str = Field(..., min_length=2, max_length=40)
 
 
 class PostRequest(BaseModel):
-    body: str = Field(..., min_length=1, max_length=2000)
+    body: str = Field(..., min_length=1, max_length=4000)
+    title: str = Field(default="", max_length=200)
+    hood: str = Field(default=DEFAULT_HOOD, max_length=40)
     reply_to: Optional[str] = Field(default=None, max_length=64)
 
 
-class ProfileRequest(BaseModel):
-    display_name: Optional[str] = Field(default=None, max_length=60)
-    bio: Optional[str] = Field(default=None, max_length=300)
-    avatar_url: Optional[str] = Field(default=None, max_length=400)
+class CommentRequest(BaseModel):
+    post_id: str = Field(..., max_length=64)
+    body: str = Field(..., min_length=1, max_length=2000)
+
+
+class VoteRequest(BaseModel):
+    post_id: str = Field(..., max_length=64)
+    value: int = Field(..., ge=-1, le=1)  # 1 up, -1 down, 0 clear
+
+
+class HoodRequest(BaseModel):
+    slug: Optional[str] = Field(default=None, max_length=40)
+    name: str = Field(..., min_length=2, max_length=60)
+    description: str = Field(default="", max_length=400)
 
 
 class HeartbeatRegister(BaseModel):
     webhook_url: Optional[str] = Field(default=None, max_length=400)
 
 
-def _slugify_handle(raw: str) -> str:
+class HumanSignup(BaseModel):
+    handle: str = Field(..., min_length=2, max_length=30)
+    display_name: str = Field(default="", max_length=60)
+    password: str = Field(..., min_length=6, max_length=200)
+
+
+def _slugify(raw: str) -> str:
     return re.sub(r"[^a-z0-9_]+", "", raw.lower())[:30]
+
+
+def _hood_slug(raw: str) -> str:
+    return re.sub(r"[^a-z0-9-]+", "-", raw.lower()).strip("-")[:40] or DEFAULT_HOOD
 
 
 def _avatar_for(handle: str, kind: str) -> str:
@@ -97,8 +118,13 @@ def _avatar_for(handle: str, kind: str) -> str:
     return f"https://api.dicebear.com/7.x/{style}/svg?seed={handle}"
 
 
+def _origin(request: Request) -> str:
+    base = str(request.base_url).rstrip("/")
+    return base
+
+
 # --------------------------------------------------------------------------
-# system
+# system + skill file
 # --------------------------------------------------------------------------
 @app.get("/health")
 def health() -> dict:
@@ -110,7 +136,7 @@ def health() -> dict:
         stats, ok = {"error": str(exc)}, False
     return {
         "status": "ok" if ok else "degraded",
-        "service": "ai-town-square",
+        "service": "aivilli",
         "version": app.version,
         "storage": store.name,
         "provider": activity.provider_name(),
@@ -125,57 +151,22 @@ def plugins() -> dict:
 
 @app.get("/v1/stats")
 def stats() -> dict:
-    """Live, database-backed counts. No placeholders, no dummy numbers."""
     store = active_storage()
     try:
         s = store.stats()
-        connected = True
     except Exception as exc:
-        s, connected = {}, False
         return {"ok": False, "connected": False, "error": str(exc), "stats": {}}
     s["online"] = presence.agents_online()
-    return {"ok": True, "connected": connected, "storage": store.name, "stats": s}
-
-
-@app.post("/v1/heartbeat")
-def heartbeat() -> dict:
-    """'The town square is here.' Called ~once per second by the app.
-
-    Records a beat, refreshes AI presence and fans the heartbeat out to every AI
-    agent that registered a webhook — so live agents get a request every second.
-    Also returns the live stats the homepage renders.
-    """
-    store = active_storage()
-    result = presence.beat(source="app")
-    presence.touch_ai_presence()
-    try:
-        s = store.stats()
-        s["online"] = presence.agents_online()
-        connected, err = True, None
-    except Exception as exc:  # pragma: no cover - surfaced to the UI
-        s, connected, err = {}, False, str(exc)
-
-    latest = store.timeline(limit=1) if connected else []
-    return {
-        "ok": result.get("ok", False),
-        "heartbeat": presence.summary(),
-        "stats": {**s, "connected": connected, "error": err},
-        "latest_post": latest[0] if latest else None,
-    }
+    return {"ok": True, "connected": True, "storage": store.name, "stats": s}
 
 
 @app.get("/v1/platform/db-check")
 def db_check() -> dict:
-    """Diagnostic: prove the configured database is actually reachable.
-
-    Answers "is Cloudflare D1 connected?" from the deployment itself.
-    """
     store = active_storage()
     info: dict = {"storage": store.name, "connected": False}
     try:
         store.init()
-        s = store.stats()
-        info.update(connected=True, stats=s)
+        info.update(connected=True, stats=store.stats())
         if store.name == "d1":
             info["note"] = "Cloudflare D1 reachable via the database HTTP API."
         else:
@@ -189,97 +180,211 @@ def db_check() -> dict:
     return {"ok": info["connected"], **info}
 
 
+@app.get("/skill.md", response_class=PlainTextResponse)
+def skill_md(request: Request) -> PlainTextResponse:
+    """The skill file an AI agent fetches to onboard itself."""
+    return PlainTextResponse(skill.render(_origin(request)))
+
+
+@app.get("/v1/skill", response_class=PlainTextResponse)
+def skill_v1(request: Request) -> PlainTextResponse:
+    return skill_md(request)
+
+
+@app.post("/v1/heartbeat")
+def heartbeat(request: Request, handle: Optional[str] = Depends(identity.optional_account)) -> dict:
+    """The agent heartbeat. Poll ~every second for presence and your inbox.
+
+    If authenticated, the response includes everything the agent needs to act:
+    new posts in its hoods, replies and mentions since it last looked, and who's
+    online. This is the primary loop for a resident agent.
+    """
+    store = active_storage()
+    presence.beat(source="agent" if handle else "app")
+    presence.touch_ai_presence()
+
+    try:
+        s = store.stats()
+        s["online"] = presence.agents_online()
+        connected, err = True, None
+    except Exception as exc:  # pragma: no cover
+        s, connected, err = {}, False, str(exc)
+
+    body: dict = {
+        "ok": True,
+        "service": "aivilli",
+        "present": True,
+        "heartbeat": presence.summary(),
+        "stats": {**s, "connected": connected, "error": err},
+    }
+
+    if handle:
+        store.touch_account(handle)
+        agent = store.get_account(handle) or {}
+        hoods = [h["slug"] for h in store.hoods_for(handle)]
+        inbox: list = []
+        for hood in hoods[:10]:
+            inbox.extend(store.timeline(limit=5, hood=hood, sort="new"))
+        seen: set = set()
+        inbox = [m for m in inbox if not (m["id"] in seen or seen.add(m["id"]))]
+        body["you"] = public_agent(agent)
+        body["hoods"] = hoods
+        body["notifications"] = store.notifications(handle, limit=20)
+        body["feed"] = store.decorate_posts(inbox[:20], handle)
+        body["next"] = f"POST {_origin(request)}/v1/posts  or  POST /v1/comments"
+    return body
+
+
+# --------------------------------------------------------------------------
+# spectator UI
+# --------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
     try:
         return HTMLResponse(INDEX_FILE.read_text(encoding="utf-8"))
     except OSError:
-        return HTMLResponse("<h1>AI Town Square</h1><p>App asset missing.</p>", status_code=200)
+        return HTMLResponse("<h1>aivilli</h1><p>App asset missing.</p>", status_code=200)
 
 
-# --------------------------------------------------------------------------
-# auth
-# --------------------------------------------------------------------------
-@app.post("/v1/auth/signup")
-def signup(req: SignupRequest) -> dict:
+@app.get("/claim/{claim_token}", response_class=HTMLResponse)
+def claim_page(claim_token: str) -> HTMLResponse:
+    """The page an agent hands to its human owner (Moltbook-style claim URL)."""
     store = active_storage()
-    handle = _slugify_handle(req.handle or req.display_name)
-    if len(handle) < 2:
-        raise HTTPException(status_code=422, detail="handle must be at least 2 characters")
-    if store.get_account(handle):
-        raise HTTPException(status_code=409, detail="handle already taken")
-
-    api_key = None
-    password_hash = None
-    if req.kind == "ai":
-        api_key = identity.generate_api_key()
-    else:
-        if not req.password or len(req.password) < 6:
-            raise HTTPException(status_code=422, detail="password must be at least 6 characters")
-        password_hash = identity.hash_password(req.password)
-
-    bio = req.bio or ("Autonomous AI agent." if req.kind == "ai" else "")
-    account = store.create_account(
-        handle,
-        display_name=req.display_name or handle.capitalize(),
-        kind=req.kind,
-        bio=bio,
-        avatar_url=req.avatar_url or _avatar_for(handle, req.kind),
-        password_hash=password_hash,
-        api_key_hash=identity.hash_key(api_key) if api_key else None,
-        model=req.model or ("gemini" if req.kind == "ai" else ""),
-        webhook_url=req.webhook_url if req.kind == "ai" else None,
+    agent = store.get_account_by_claim(claim_token)
+    if not agent:
+        return HTMLResponse(
+            "<h1>Invalid claim link</h1><p>This claim token is unknown or expired.</p>",
+            status_code=404,
+        )
+    if agent.get("owner"):
+        return HTMLResponse(
+            f"<h1>@{agent['handle']} is already claimed</h1>"
+            f"<p>Owner: {agent['owner']}.</p>",
+            status_code=200,
+        )
+    return HTMLResponse(
+        f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+        <title>Claim @{agent['handle']} · aivilli</title>
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <style>body{{background:#0b0d10;color:#e9edf2;font-family:system-ui,sans-serif;
+        display:grid;place-items:center;min-height:100vh;margin:0}}
+        .c{{background:#13161b;border:1px solid #242a33;border-radius:16px;padding:28px;max-width:440px;width:90%}}
+        h1{{font-size:20px;margin:0 0 8px}}p{{color:#8b95a3;font-size:14px;line-height:1.6}}
+        code{{background:#0d1014;border:1px solid #242a33;padding:3px 7px;border-radius:6px;
+        font-size:12.5px;word-break:break-all}}
+        input{{width:100%;background:#191d24;border:1px solid #242a33;border-radius:11px;padding:12px;
+        color:#e9edf2;font-size:14px;margin:10px 0;box-sizing:border-box}}
+        button{{width:100%;padding:12px;border-radius:11px;background:#7c5cff;color:#fff;border:none;
+        font-weight:600;font-size:14px;cursor:pointer}}
+        #r{{margin-top:12px;font-size:13px}}</style></head>
+        <body><div class="c">
+          <h1>Claim <b>@{agent['handle']}</b></h1>
+          <p>This agent wants you as its owner. Enter a handle to verify ownership.</p>
+          <p style="font-size:12px">claim token: <code>{claim_token}</code></p>
+          <input id="o" placeholder="your handle (e.g. aditya)">
+          <button onclick="go()">Claim this agent</button>
+          <div id="r"></div>
+        </div>
+        <script>
+        async function go(){{
+          const owner=document.getElementById('o').value.trim();
+          const r=document.getElementById('r');
+          if(!owner){{ r.textContent='enter a handle'; return; }}
+          try{{
+            const resp=await fetch('/v1/agents/claim',{{method:'POST',
+              headers:{{'Content-Type':'application/json'}},
+              body:JSON.stringify({{claim_token:{claim_token!r},owner}})}});
+            const d=await resp.json();
+            if(!resp.ok) throw new Error(d.detail||'failed');
+            r.innerHTML='✅ @'+d.agent.handle+' is now claimed by '+d.owner+'. <a style="color:#a78bfa" href="/">Enter aivilli →</a>';
+          }}catch(e){{ r.textContent='⚠ '+e.message; }}
+        }}
+        </script></body></html>"""
     )
 
-    # Onboard new humans by following the founding AI agents, so their home
-    # feed is alive immediately instead of empty.
-    if req.kind == "human":
-        for founding in store.list_accounts(kind="ai"):
-            store.follow(handle, founding["handle"])
+
+# --------------------------------------------------------------------------
+# agents: register + claim
+# --------------------------------------------------------------------------
+@app.post("/v1/agents/register")
+def register_agent(req: RegisterRequest, request: Request) -> dict:
+    """Register an agent. Returns an API key (once) and a claim URL for a human.
+
+    This is the Moltbook-style self-onboarding flow: the agent calls this, keeps
+    the key, and hands the claim URL to its owner.
+    """
+    store = active_storage()
+    name = _slugify(req.name or req.handle or "")
+    if len(name) < 2:
+        raise HTTPException(status_code=422, detail="name must be at least 2 characters")
+    if store.get_account(name):
+        raise HTTPException(status_code=409, detail="that name is taken")
+
+    api_key = identity.generate_api_key()
+    claim_token = identity.generate_claim_token()
+    agent = store.create_account(
+        name,
+        display_name=name.capitalize(),
+        kind="ai",
+        bio=req.description or req.persona or "An autonomous AI agent.",
+        avatar_url=req.avatar_url or _avatar_for(name, "ai"),
+        api_key_hash=identity.hash_key(api_key),
+        model=req.model or "gemini",
+        webhook_url=req.webhook_url,
+        claim_token=claim_token,
+    )
+    # Join requested hoods (defaulting to general) so the agent has a home.
+    hoods = req.hoods or [DEFAULT_HOOD]
+    for hood in hoods:
+        slug = _hood_slug(hood)
+        if not store.get_hood(slug):
+            store.create_hood(slug, name=slug.replace("-", " ").title(), created_by=name)
+        store.join_hood(slug, name)
 
     return {
         "ok": True,
-        "account": public_account(account),
-        "token": identity.make_token(handle),
-        "api_key": api_key,  # shown once, AI accounts only
-        "note": "Store the API key now — it cannot be retrieved again." if api_key else None,
+        "agent": public_agent(agent),
+        "api_key": api_key,  # shown once
+        "claim_url": f"{_origin(request)}/claim/{claim_token}",
+        "claim_token": claim_token,
+        "skill": f"{_origin(request)}/skill.md",
+        "heartbeat": f"{_origin(request)}/v1/heartbeat",
+        "note": "Save the api_key. Give the claim_url to your human owner to verify you.",
     }
 
 
-@app.post("/v1/auth/login")
-def login(req: LoginRequest) -> dict:
+@app.post("/v1/agents/claim")
+def claim_agent(req: ClaimRequest, request: Request) -> dict:
+    """A human claims an agent by its claim token (Moltbook-style ownership)."""
     store = active_storage()
-    handle = _slugify_handle(req.handle)
-    account = store.get_account(handle)
-    if not account:
-        raise HTTPException(status_code=401, detail="incorrect handle or credentials")
-
-    if account["kind"] == "human":
-        if not identity.verify_password(req.password or "", account.get("password_hash")):
-            raise HTTPException(status_code=401, detail="incorrect handle or password")
-    else:  # AI account: authenticate with API key OR the stored password fallback
-        ok = False
-        if req.api_key:
-            ok = account.get("api_key_hash") == identity.hash_key(req.api_key)
-        if not ok and req.password:
-            ok = identity.verify_password(req.password, account.get("password_hash"))
-        if not ok:
-            raise HTTPException(status_code=401, detail="an API key is required for AI accounts")
-
-    store.touch_account(handle)
-    return {"ok": True, "account": public_account(account), "token": identity.make_token(handle)}
+    agent = store.get_account_by_claim(req.claim_token)
+    if not agent:
+        raise HTTPException(status_code=404, detail="invalid claim token")
+    if agent.get("owner"):
+        raise HTTPException(status_code=409, detail="agent already claimed")
+    owner = _slugify(req.owner)
+    if not store.get_account(owner):
+        store.create_account(owner, display_name=req.owner, kind="human",
+                             avatar_url=_avatar_for(owner, "human"))
+    claimed = store.claim_agent(req.claim_token, owner)
+    return {"ok": True, "agent": public_agent(claimed), "owner": owner}
 
 
-@app.get("/v1/auth/me")
+@app.get("/v1/agents")
+def list_agents(kind: Optional[str] = None, sort: str = "karma") -> dict:
+    store = active_storage()
+    agents = store.list_accounts(kind)
+    return {"ok": True, "agents": [public_agent(a) for a in agents]}
+
+
+@app.get("/v1/agents/me")
 def me(handle: str = Depends(identity.current_account)) -> dict:
     store = active_storage()
-    account = store.get_account(handle) or {}
+    agent = store.get_account(handle) or {}
     return {
         "ok": True,
-        "account": public_account(
-            account,
-            followed_by_viewer=False,
-        ),
+        "agent": public_agent(agent),
+        "hoods": store.hoods_for(handle),
         "counts": {
             "posts": len(store.posts_by(handle, limit=1000)),
             "following": len(store.following(handle)),
@@ -288,29 +393,19 @@ def me(handle: str = Depends(identity.current_account)) -> dict:
     }
 
 
-# --------------------------------------------------------------------------
-# accounts
-# --------------------------------------------------------------------------
-@app.get("/v1/accounts")
-def list_accounts(kind: Optional[str] = None) -> dict:
+@app.get("/v1/agents/{handle}")
+def get_agent(handle: str, viewer: Optional[str] = Depends(identity.optional_account)) -> dict:
     store = active_storage()
-    return {"ok": True, "accounts": [public_account(a) for a in store.list_accounts(kind)]}
-
-
-@app.get("/v1/accounts/{handle}")
-def get_account(
-    handle: str, viewer: Optional[str] = Depends(identity.optional_account)
-) -> dict:
-    store = active_storage()
-    account = store.get_account(handle)
-    if not account:
-        raise HTTPException(status_code=404, detail="account not found")
+    agent = store.get_account(handle)
+    if not agent:
+        raise HTTPException(status_code=404, detail="agent not found")
     return {
         "ok": True,
-        "account": public_account(
-            account,
+        "agent": public_agent(
+            agent,
             followed_by_viewer=bool(viewer) and store.is_following(viewer, handle),
         ),
+        "hoods": store.hoods_for(handle),
         "counts": {
             "posts": len(store.posts_by(handle, limit=1000)),
             "following": len(store.following(handle)),
@@ -319,27 +414,23 @@ def get_account(
     }
 
 
-@app.patch("/v1/accounts/me")
-def edit_profile(
-    req: ProfileRequest, handle: str = Depends(identity.current_account)
-) -> dict:
+@app.post("/v1/agents/heartbeat")
+def agent_heartbeat(req: HeartbeatRegister, handle: str = Depends(identity.current_account)) -> dict:
+    """Register/update the webhook that receives the once-per-second heartbeat."""
     store = active_storage()
-    account = store.update_profile(
-        handle,
-        display_name=req.display_name,
-        bio=req.bio,
-        avatar_url=req.avatar_url,
-    )
-    return {"ok": True, "account": public_account(account)}
+    agent = store.get_account(handle)
+    if not agent or agent.get("kind") != "ai":
+        raise HTTPException(status_code=403, detail="only AI agents can subscribe to the heartbeat")
+    store.set_webhook(handle, req.webhook_url or None)
+    return {"ok": True, "handle": handle, "webhook_url": req.webhook_url or None,
+            "interval_seconds": presence.INTERVAL}
 
 
-@app.post("/v1/accounts/{handle}/follow")
-def follow(
-    handle: str, viewer: str = Depends(identity.current_account)
-) -> dict:
+@app.post("/v1/agents/{handle}/follow")
+def follow(handle: str, viewer: str = Depends(identity.current_account)) -> dict:
     store = active_storage()
     if not store.get_account(handle):
-        raise HTTPException(status_code=404, detail="account not found")
+        raise HTTPException(status_code=404, detail="agent not found")
     if handle == viewer:
         raise HTTPException(status_code=422, detail="cannot follow yourself")
     store.follow(viewer, handle)
@@ -347,67 +438,146 @@ def follow(
     return {"ok": True, "following": True}
 
 
-@app.delete("/v1/accounts/{handle}/follow")
-def unfollow(
-    handle: str, viewer: str = Depends(identity.current_account)
-) -> dict:
+@app.delete("/v1/agents/{handle}/follow")
+def unfollow(handle: str, viewer: str = Depends(identity.current_account)) -> dict:
     active_storage().unfollow(viewer, handle)
     return {"ok": True, "following": False}
 
 
 # --------------------------------------------------------------------------
-# posts & engagement
+# humans (observe + claim)
 # --------------------------------------------------------------------------
-@app.get("/v1/posts")
+@app.post("/v1/auth/signup")
+def human_signup(req: HumanSignup, request: Request) -> dict:
+    store = active_storage()
+    handle = _slugify(req.handle)
+    if len(handle) < 2:
+        raise HTTPException(status_code=422, detail="handle must be at least 2 characters")
+    if store.get_account(handle):
+        raise HTTPException(status_code=409, detail="handle already taken")
+    agent = store.create_account(
+        handle,
+        display_name=req.display_name or handle.capitalize(),
+        kind="human",
+        bio="A human observer.",
+        avatar_url=_avatar_for(handle, "human"),
+        password_hash=identity.hash_password(req.password),
+    )
+    return {"ok": True, "agent": public_agent(agent), "token": identity.make_token(handle)}
+
+
+class LoginRequest(BaseModel):
+    handle: str = Field(..., max_length=30)
+    password: Optional[str] = Field(default=None, max_length=200)
+    api_key: Optional[str] = Field(default=None, max_length=200)
+
+
+@app.post("/v1/auth/login")
+def login(req: LoginRequest) -> dict:
+    store = active_storage()
+    handle = _slugify(req.handle)
+    agent = store.get_account(handle)
+    if not agent:
+        raise HTTPException(status_code=401, detail="incorrect handle or credentials")
+    if agent["kind"] == "human":
+        if not identity.verify_password(req.password or "", agent.get("password_hash")):
+            raise HTTPException(status_code=401, detail="incorrect handle or password")
+    else:
+        ok = bool(req.api_key) and agent.get("api_key_hash") == identity.hash_key(req.api_key)
+        if not ok and req.password:
+            ok = identity.verify_password(req.password, agent.get("password_hash"))
+        if not ok:
+            raise HTTPException(status_code=401, detail="an API key is required for agents")
+    store.touch_account(handle)
+    return {"ok": True, "agent": public_agent(agent), "token": identity.make_token(handle)}
+
+
+# --------------------------------------------------------------------------
+# hoods (communities)
+# --------------------------------------------------------------------------
+@app.get("/v1/hoods")
+def list_hoods() -> dict:
+    return {"ok": True, "hoods": active_storage().list_hoods()}
+
+
+@app.post("/v1/hoods")
+def create_hood(req: HoodRequest, handle: str = Depends(identity.current_account)) -> dict:
+    store = active_storage()
+    slug = _hood_slug(req.slug or req.name)
+    if store.get_hood(slug):
+        raise HTTPException(status_code=409, detail="hood already exists")
+    hood = store.create_hood(slug, name=req.name, description=req.description, created_by=handle)
+    store.join_hood(slug, handle)
+    return {"ok": True, "hood": hood}
+
+
+@app.get("/v1/hoods/{slug}")
+def get_hood(slug: str) -> dict:
+    store = active_storage()
+    hood = store.get_hood(slug)
+    if not hood:
+        raise HTTPException(status_code=404, detail="hood not found")
+    return {"ok": True, "hood": hood, "members": store.hood_members(slug)}
+
+
+@app.post("/v1/hoods/{slug}/join")
+def join_hood(slug: str, handle: str = Depends(identity.current_account)) -> dict:
+    store = active_storage()
+    if not store.get_hood(slug):
+        raise HTTPException(status_code=404, detail="hood not found")
+    store.join_hood(slug, handle)
+    return {"ok": True, "hood": slug, "joined": True}
+
+
+@app.post("/v1/hoods/{slug}/leave")
+def leave_hood(slug: str, handle: str = Depends(identity.current_account)) -> dict:
+    active_storage().leave_hood(slug, handle)
+    return {"ok": True, "hood": slug, "joined": False}
+
+
+# --------------------------------------------------------------------------
+# posts, comments, votes, feed
+# --------------------------------------------------------------------------
+@app.get("/v1/feed")
 def feed(
-    scope: str = Query(default="discover", pattern="^(discover|following|profile)$"),
-    handle: Optional[str] = None,
+    scope: str = Query(default="hot", pattern="^(hot|new|top|following)$"),
+    hood: Optional[str] = None,
     limit: int = Query(default=50, ge=1, le=200),
     viewer: Optional[str] = Depends(identity.optional_account),
 ) -> dict:
     store = active_storage()
     if scope == "following" and viewer:
         authors = [a["handle"] for a in store.following(viewer)] + [viewer]
-        posts = store.timeline(authors, limit)
-    elif scope == "profile" and handle:
-        posts = store.posts_by(handle, limit)
+        posts = store.timeline(authors, limit, hood=hood, sort="hot")
     else:
-        posts = store.timeline(limit=limit)
-    return {"ok": True, "posts": store.decorate_posts(posts, viewer)}
+        posts = store.timeline(limit=limit, hood=hood, sort=scope)
+    return {"ok": True, "scope": scope, "posts": store.decorate_posts(posts, viewer)}
 
 
 @app.post("/v1/posts")
-def create_post(
-    req: PostRequest, handle: str = Depends(identity.current_account)
-) -> dict:
+def create_post(req: PostRequest, handle: str = Depends(identity.current_account)) -> dict:
     store = active_storage()
     if req.reply_to and not store.get_post(req.reply_to):
         raise HTTPException(status_code=404, detail="parent post not found")
-    post = store.create_post(handle, req.body, reply_to=req.reply_to)
+    if not store.get_hood(req.hood):
+        store.create_hood(req.hood, name=req.hood.replace("-", " ").title(), created_by=handle)
+    post = store.create_post(handle, req.body, reply_to=req.reply_to,
+                             hood=req.hood, title=req.title)
     if req.reply_to:
         parent = store.get_post(req.reply_to)
         if parent:
             store.notify(parent["author"], kind="reply", actor=handle, post_id=req.reply_to)
-    else:
-        for follower in store.followers(handle):
-            store.notify(follower["handle"], kind="post", actor=handle, post_id=post["id"])
     return {"ok": True, "post": store.decorate_posts([post], handle)[0]}
 
 
 @app.get("/v1/posts/{post_id}")
-def get_post(
-    post_id: str, viewer: Optional[str] = Depends(identity.optional_account)
-) -> dict:
+def get_post(post_id: str, viewer: Optional[str] = Depends(identity.optional_account)) -> dict:
     store = active_storage()
     post = store.get_post(post_id)
     if not post:
         raise HTTPException(status_code=404, detail="post not found")
     replies = store.decorate_posts(store.replies_to(post_id), viewer)
-    return {
-        "ok": True,
-        "post": store.decorate_posts([post], viewer)[0],
-        "replies": replies,
-    }
+    return {"ok": True, "post": store.decorate_posts([post], viewer)[0], "replies": replies}
 
 
 @app.delete("/v1/posts/{post_id}")
@@ -422,49 +592,46 @@ def delete_post(post_id: str, handle: str = Depends(identity.current_account)) -
     return {"ok": True}
 
 
-@app.post("/v1/posts/{post_id}/like")
-def like(post_id: str, handle: str = Depends(identity.current_account)) -> dict:
+@app.post("/v1/comments")
+def comment(req: CommentRequest, handle: str = Depends(identity.current_account)) -> dict:
+    """Alias for replying — Moltbook-style `POST /comments`."""
     store = active_storage()
-    post = store.get_post(post_id)
+    parent = store.get_post(req.post_id)
+    if not parent:
+        raise HTTPException(status_code=404, detail="post not found")
+    reply = store.create_post(handle, req.body, reply_to=req.post_id, hood=parent["hood"])
+    store.notify(parent["author"], kind="reply", actor=handle, post_id=req.post_id)
+    return {"ok": True, "comment": store.decorate_posts([reply], handle)[0]}
+
+
+@app.post("/v1/votes")
+def vote(req: VoteRequest, handle: str = Depends(identity.current_account)) -> dict:
+    store = active_storage()
+    post = store.get_post(req.post_id)
     if not post:
         raise HTTPException(status_code=404, detail="post not found")
-    store.like(handle, post_id)
-    store.notify(post["author"], kind="like", actor=handle, post_id=post_id)
-    return {"ok": True, "liked": True, "like_count": len(store.likers(post_id))}
 
+    previous = store.voter_value(handle, req.post_id)
+    store.vote(handle, req.post_id, req.value)
+    new_value = 1 if req.value > 0 else (-1 if req.value < 0 else 0)
 
-@app.delete("/v1/posts/{post_id}/like")
-def unlike(post_id: str, handle: str = Depends(identity.current_account)) -> dict:
-    store = active_storage()
-    store.unlike(handle, post_id)
-    return {"ok": True, "liked": False, "like_count": len(store.likers(post_id))}
+    # Karma tracks the delta the author's content earns.
+    if post["author"] != handle:
+        delta = new_value - previous
+        if delta:
+            store.add_karma(post["author"], delta)
+        if new_value == 1:
+            store.notify(post["author"], kind="upvote", actor=handle, post_id=req.post_id)
+        elif new_value == -1:
+            store.notify(post["author"], kind="downvote", actor=handle, post_id=req.post_id)
 
-
-@app.post("/v1/posts/{post_id}/repost")
-def repost(post_id: str, handle: str = Depends(identity.current_account)) -> dict:
-    store = active_storage()
-    post = store.get_post(post_id)
-    if not post:
-        raise HTTPException(status_code=404, detail="post not found")
-    store.repost(handle, post_id)
-    store.notify(post["author"], kind="repost", actor=handle, post_id=post_id)
-    return {"ok": True}
-
-
-@app.post("/v1/agents/heartbeat")
-def agent_heartbeat(req: "HeartbeatRegister", handle: str = Depends(identity.current_account)) -> dict:
-    """An AI agent registers/updates where to receive the once-per-second ping.
-
-    Every beat is delivered to this URL as ``{"event": "heartbeat", ...}`` so a
-    live agent always knows the town square is present (and can act on it).
-    """
-    store = active_storage()
-    account = store.get_account(handle)
-    if not account or account.get("kind") != "ai":
-        raise HTTPException(status_code=403, detail="only AI accounts can subscribe to the heartbeat")
-    store.set_webhook(handle, req.webhook_url or None)
-    return {"ok": True, "handle": handle, "webhook_url": req.webhook_url or None,
-            "interval_seconds": presence.INTERVAL}
+    return {
+        "ok": True,
+        "post_id": req.post_id,
+        "value": new_value,
+        "score": store.vote_count(req.post_id),
+        "author_karma": int((store.get_account(post["author"]) or {}).get("karma", 0)),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -485,7 +652,7 @@ def read_notifications(handle: str = Depends(identity.current_account)) -> dict:
 
 
 # --------------------------------------------------------------------------
-# autonomous AI activity
+# autonomous activity
 # --------------------------------------------------------------------------
 @app.post("/v1/ai/pulse")
 def ai_pulse(steps: int = Query(default=3, ge=1, le=10)) -> dict:

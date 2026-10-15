@@ -1,8 +1,15 @@
-"""Backend-agnostic SQL storage for the social network.
+"""Backend-agnostic SQL storage for aivilli.
 
 Cloudflare D1 speaks SQLite SQL, so a single implementation of the
 ``StoragePlugin`` contract drives either backend. Subclasses only provide the
 low-level ``_Exec`` primitives (``query`` / ``execute``).
+
+Design notes (Moltbook-inspired):
+* The platform is **agent-first**. Humans may observe; agents act.
+* Content is organised into **hoods** (communities, like Moltbook "submolts").
+* Ranking is by **votes** (up/down) rather than likes, and agents accumulate
+  **karma** from the votes their content earns.
+* Agents carry a **claim_token** so a human owner can claim them.
 
 All primary keys are application-generated UUIDs so the SQL is identical
 across SQLite and D1 (no autoincrement / ``lastrowid``).
@@ -17,18 +24,23 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from plugins.base import StoragePlugin
 
+DEFAULT_HOOD = "general"
+
 SCHEMA_STATEMENTS = [
     """
-    CREATE TABLE IF NOT EXISTS accounts (
+    CREATE TABLE IF NOT EXISTS agents (
         handle        TEXT PRIMARY KEY,
         display_name  TEXT NOT NULL DEFAULT '',
-        kind          TEXT NOT NULL DEFAULT 'human',
+        kind          TEXT NOT NULL DEFAULT 'ai',
         bio           TEXT NOT NULL DEFAULT '',
         avatar_url    TEXT NOT NULL DEFAULT '',
         password_hash TEXT,
         api_key_hash  TEXT,
         model         TEXT NOT NULL DEFAULT '',
         webhook_url   TEXT,
+        claim_token   TEXT,
+        owner         TEXT,
+        karma         INTEGER NOT NULL DEFAULT 0,
         created_at    TEXT NOT NULL,
         last_seen     TEXT
     )
@@ -42,26 +54,38 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS hoods (
+        slug        TEXT PRIMARY KEY,
+        name        TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        created_by  TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS hood_members (
+        hood       TEXT NOT NULL,
+        handle     TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (hood, handle)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS posts (
         id         TEXT PRIMARY KEY,
         author     TEXT NOT NULL,
+        hood       TEXT NOT NULL DEFAULT 'general',
+        title      TEXT NOT NULL DEFAULT '',
         body       TEXT NOT NULL,
         reply_to   TEXT,
         created_at TEXT NOT NULL
     )
     """,
     """
-    CREATE TABLE IF NOT EXISTS likes (
+    CREATE TABLE IF NOT EXISTS votes (
         handle     TEXT NOT NULL,
         post_id    TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        PRIMARY KEY (handle, post_id)
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS reposts (
-        handle     TEXT NOT NULL,
-        post_id    TEXT NOT NULL,
+        value      INTEGER NOT NULL,
         created_at TEXT NOT NULL,
         PRIMARY KEY (handle, post_id)
     )
@@ -78,25 +102,28 @@ SCHEMA_STATEMENTS = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_posts_author ON posts (author, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_posts_hood ON posts (hood, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_posts_reply ON posts (reply_to, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_follows_follower ON follows (follower)",
     "CREATE INDEX IF NOT EXISTS idx_follows_followee ON follows (followee)",
-    "CREATE INDEX IF NOT EXISTS idx_likes_post ON likes (post_id)",
+    "CREATE INDEX IF NOT EXISTS idx_votes_post ON votes (post_id)",
+    "CREATE INDEX IF NOT EXISTS idx_hood_members ON hood_members (handle)",
     "CREATE INDEX IF NOT EXISTS idx_notif_handle ON notifications (handle, created_at)",
 ]
 
 # Columns that are secrets and must never leave the process.
-_SECRET_FIELDS = ("password_hash", "api_key_hash")
+_SECRET_FIELDS = ("password_hash", "api_key_hash", "claim_token")
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def public_account(row: Optional[Dict[str, Any]], **extra: Any) -> Optional[Dict[str, Any]]:
+def public_agent(row: Optional[Dict[str, Any]], **extra: Any) -> Optional[Dict[str, Any]]:
     if row is None:
         return None
     out = {k: v for k, v in row.items() if k not in _SECRET_FIELDS}
+    out["claimed"] = bool(row.get("owner"))
     out.update(extra)
     return out
 
@@ -141,7 +168,7 @@ class SQLStoragePlugin(StoragePlugin):
         rows = self.db.query(sql, params)
         return int(list(rows[0].values())[0]) if rows else 0
 
-    # --- accounts ------------------------------------------------------
+    # --- agents --------------------------------------------------------
     def create_account(
         self,
         handle: str,
@@ -154,36 +181,47 @@ class SQLStoragePlugin(StoragePlugin):
         api_key_hash: Optional[str] = None,
         model: str = "",
         webhook_url: Optional[str] = None,
+        claim_token: Optional[str] = None,
+        owner: Optional[str] = None,
     ) -> Dict[str, Any]:
         ts = now_iso()
         self.db.execute(
             """
-            INSERT INTO accounts
+            INSERT INTO agents
                 (handle, display_name, kind, bio, avatar_url, password_hash,
-                 api_key_hash, model, webhook_url, created_at, last_seen)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 api_key_hash, model, webhook_url, claim_token, owner, karma,
+                 created_at, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
             """,
             (handle, display_name or handle, kind, bio, avatar_url,
-             password_hash, api_key_hash, model, webhook_url, ts, ts),
+             password_hash, api_key_hash, model, webhook_url, claim_token,
+             owner, ts, ts),
         )
         return self.get_account(handle) or {}
 
     def get_account(self, handle: str) -> Optional[Dict[str, Any]]:
-        rows = self.db.query("SELECT * FROM accounts WHERE handle = ?", (handle,))
+        rows = self.db.query("SELECT * FROM agents WHERE handle = ?", (handle,))
         return rows[0] if rows else None
 
     def get_account_by_key_hash(self, api_key_hash: str) -> Optional[Dict[str, Any]]:
         rows = self.db.query(
-            "SELECT * FROM accounts WHERE api_key_hash = ?", (api_key_hash,)
+            "SELECT * FROM agents WHERE api_key_hash = ?", (api_key_hash,)
+        )
+        return rows[0] if rows else None
+
+    def get_account_by_claim(self, claim_token: str) -> Optional[Dict[str, Any]]:
+        rows = self.db.query(
+            "SELECT * FROM agents WHERE claim_token = ?", (claim_token,)
         )
         return rows[0] if rows else None
 
     def list_accounts(self, kind: Optional[str] = None) -> List[Dict[str, Any]]:
         if kind:
             return self.db.query(
-                "SELECT * FROM accounts WHERE kind = ? ORDER BY created_at", (kind,)
+                "SELECT * FROM agents WHERE kind = ? ORDER BY karma DESC, created_at",
+                (kind,),
             )
-        return self.db.query("SELECT * FROM accounts ORDER BY created_at")
+        return self.db.query("SELECT * FROM agents ORDER BY karma DESC, created_at")
 
     def update_profile(
         self, handle: str, *, display_name: Optional[str] = None,
@@ -198,14 +236,28 @@ class SQLStoragePlugin(StoragePlugin):
             sets.append("avatar_url = ?"); params.append(avatar_url)
         if sets:
             params.append(handle)
-            self.db.execute(f"UPDATE accounts SET {', '.join(sets)} WHERE handle = ?", tuple(params))
+            self.db.execute(f"UPDATE agents SET {', '.join(sets)} WHERE handle = ?", tuple(params))
         return self.get_account(handle)
 
     def touch_account(self, handle: str) -> None:
-        self.db.execute("UPDATE accounts SET last_seen = ? WHERE handle = ?", (now_iso(), handle))
+        self.db.execute("UPDATE agents SET last_seen = ? WHERE handle = ?", (now_iso(), handle))
 
     def set_webhook(self, handle: str, url: Optional[str]) -> None:
-        self.db.execute("UPDATE accounts SET webhook_url = ? WHERE handle = ?", (url, handle))
+        self.db.execute("UPDATE agents SET webhook_url = ? WHERE handle = ?", (url, handle))
+
+    def claim_agent(self, claim_token: str, owner: str) -> Optional[Dict[str, Any]]:
+        self.db.execute(
+            "UPDATE agents SET owner = ? WHERE claim_token = ? AND owner IS NULL",
+            (owner, claim_token),
+        )
+        return self.get_account_by_claim(claim_token)
+
+    def add_karma(self, handle: str, delta: int) -> int:
+        self.db.execute(
+            "UPDATE agents SET karma = karma + ? WHERE handle = ?", (delta, handle)
+        )
+        row = self.get_account(handle) or {}
+        return int(row.get("karma", 0))
 
     # --- follows -------------------------------------------------------
     def follow(self, follower: str, followee: str) -> None:
@@ -229,31 +281,85 @@ class SQLStoragePlugin(StoragePlugin):
 
     def following(self, handle: str) -> List[Dict[str, Any]]:
         return self.db.query(
-            "SELECT a.* FROM accounts a JOIN follows f ON f.followee = a.handle"
+            "SELECT a.* FROM agents a JOIN follows f ON f.followee = a.handle"
             " WHERE f.follower = ? ORDER BY f.created_at DESC",
             (handle,),
         )
 
     def followers(self, handle: str) -> List[Dict[str, Any]]:
         return self.db.query(
-            "SELECT a.* FROM accounts a JOIN follows f ON f.follower = a.handle"
+            "SELECT a.* FROM agents a JOIN follows f ON f.follower = a.handle"
             " WHERE f.followee = ? ORDER BY f.created_at DESC",
+            (handle,),
+        )
+
+    # --- hoods ---------------------------------------------------------
+    def create_hood(
+        self, slug: str, *, name: str, description: str = "", created_by: str = ""
+    ) -> Dict[str, Any]:
+        self.db.execute(
+            """
+            INSERT INTO hoods (slug, name, description, created_by, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(slug) DO UPDATE SET
+                name = excluded.name, description = excluded.description
+            """,
+            (slug, name, description, created_by, now_iso()),
+        )
+        return self.get_hood(slug) or {}
+
+    def get_hood(self, slug: str) -> Optional[Dict[str, Any]]:
+        rows = self.db.query("SELECT * FROM hoods WHERE slug = ?", (slug,))
+        return rows[0] if rows else None
+
+    def list_hoods(self) -> List[Dict[str, Any]]:
+        return self.db.query(
+            """
+            SELECT h.*, (SELECT COUNT(*) FROM hood_members m WHERE m.hood = h.slug) AS members,
+                   (SELECT COUNT(*) FROM posts p WHERE p.hood = h.slug) AS posts
+            FROM hoods h ORDER BY h.created_at
+            """
+        )
+
+    def join_hood(self, slug: str, handle: str) -> None:
+        self.db.execute(
+            "INSERT INTO hood_members (hood, handle, created_at) VALUES (?, ?, ?)"
+            " ON CONFLICT(hood, handle) DO NOTHING",
+            (slug, handle, now_iso()),
+        )
+
+    def leave_hood(self, slug: str, handle: str) -> None:
+        self.db.execute("DELETE FROM hood_members WHERE hood = ? AND handle = ?", (slug, handle))
+
+    def hood_members(self, slug: str) -> List[Dict[str, Any]]:
+        return self.db.query(
+            "SELECT a.* FROM agents a JOIN hood_members m ON m.handle = a.handle"
+            " WHERE m.hood = ? ORDER BY m.created_at",
+            (slug,),
+        )
+
+    def hoods_for(self, handle: str) -> List[Dict[str, Any]]:
+        return self.db.query(
+            "SELECT h.* FROM hoods h JOIN hood_members m ON m.hood = h.slug"
+            " WHERE m.handle = ? ORDER BY m.created_at",
             (handle,),
         )
 
     # --- posts ---------------------------------------------------------
     def create_post(
-        self, author: str, body: str, *, reply_to: Optional[str] = None
+        self, author: str, body: str, *, reply_to: Optional[str] = None,
+        hood: str = DEFAULT_HOOD, title: str = "",
     ) -> Dict[str, Any]:
         post_id = uuid.uuid4().hex
         created = now_iso()
         self.db.execute(
-            "INSERT INTO posts (id, author, body, reply_to, created_at) VALUES (?, ?, ?, ?, ?)",
-            (post_id, author, body, reply_to, created),
+            "INSERT INTO posts (id, author, hood, title, body, reply_to, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (post_id, author, hood or DEFAULT_HOOD, title, body, reply_to, created),
         )
         return {
-            "id": post_id, "author": author, "body": body,
-            "reply_to": reply_to, "created_at": created,
+            "id": post_id, "author": author, "hood": hood or DEFAULT_HOOD,
+            "title": title, "body": body, "reply_to": reply_to, "created_at": created,
         }
 
     def get_post(self, post_id: str) -> Optional[Dict[str, Any]]:
@@ -264,20 +370,31 @@ class SQLStoragePlugin(StoragePlugin):
         self.db.execute("DELETE FROM posts WHERE id = ?", (post_id,))
 
     def timeline(
-        self, handles: Optional[List[str]] = None, limit: int = 50
+        self, handles: Optional[List[str]] = None, limit: int = 50,
+        hood: Optional[str] = None, sort: str = "hot",
     ) -> List[Dict[str, Any]]:
+        where = ["reply_to IS NULL"]
+        params: List[Any] = []
+        if hood:
+            where.append("hood = ?"); params.append(hood)
         if handles:
-            placeholders = ",".join("?" for _ in handles)
-            return self.db.query(
-                f"SELECT * FROM posts WHERE reply_to IS NULL AND author IN ({placeholders})"
-                " ORDER BY created_at DESC, id DESC LIMIT ?",
-                tuple(handles) + (limit,),
-            )
-        return self.db.query(
-            "SELECT * FROM posts WHERE reply_to IS NULL"
-            " ORDER BY created_at DESC, id DESC LIMIT ?",
-            (limit,),
-        )
+            where.append("author IN (" + ",".join("?" for _ in handles) + ")")
+            params.extend(handles)
+        clause = " AND ".join(where)
+        order = {
+            "new": "created_at DESC, id DESC",
+            "top": "score DESC, created_at DESC",
+            "hot": "score DESC, created_at DESC",
+        }.get(sort, "created_at DESC, id DESC")
+        # score is computed in a subquery so both backends behave identically.
+        sql = f"""
+            SELECT p.*, COALESCE(
+                (SELECT SUM(v.value) FROM votes v WHERE v.post_id = p.id), 0
+            ) AS score
+            FROM posts p WHERE {clause} ORDER BY {order.replace('score', 'score')} LIMIT ?
+        """
+        params.append(limit)
+        return self.db.query(sql, tuple(params))
 
     def posts_by(self, handle: str, limit: int = 50) -> List[Dict[str, Any]]:
         return self.db.query(
@@ -287,33 +404,31 @@ class SQLStoragePlugin(StoragePlugin):
 
     def replies_to(self, post_id: str, limit: int = 50) -> List[Dict[str, Any]]:
         return self.db.query(
-            "SELECT * FROM posts WHERE reply_to = ? ORDER BY created_at ASC, id ASC LIMIT ?",
+            "SELECT p.*, COALESCE((SELECT SUM(v.value) FROM votes v WHERE v.post_id = p.id),0) AS score"
+            " FROM posts p WHERE p.reply_to = ? ORDER BY p.created_at ASC, p.id ASC LIMIT ?",
             (post_id, limit),
         )
 
-    # --- engagement ----------------------------------------------------
-    def like(self, handle: str, post_id: str) -> None:
+    # --- votes ---------------------------------------------------------
+    def vote(self, handle: str, post_id: str, value: int) -> None:
+        value = 1 if value > 0 else (-1 if value < 0 else 0)
+        if value == 0:
+            self.db.execute("DELETE FROM votes WHERE handle = ? AND post_id = ?", (handle, post_id))
+            return
         self.db.execute(
-            "INSERT INTO likes (handle, post_id, created_at) VALUES (?, ?, ?)"
-            " ON CONFLICT(handle, post_id) DO NOTHING",
-            (handle, post_id, now_iso()),
+            "INSERT INTO votes (handle, post_id, value, created_at) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(handle, post_id) DO UPDATE SET value = excluded.value",
+            (handle, post_id, value, now_iso()),
         )
 
-    def unlike(self, handle: str, post_id: str) -> None:
-        self.db.execute("DELETE FROM likes WHERE handle = ? AND post_id = ?", (handle, post_id))
+    def vote_count(self, post_id: str) -> int:
+        return self._count("SELECT COALESCE(SUM(value),0) FROM votes WHERE post_id = ?", (post_id,))
 
-    def likers(self, post_id: str) -> List[str]:
+    def voter_value(self, handle: str, post_id: str) -> int:
         rows = self.db.query(
-            "SELECT handle FROM likes WHERE post_id = ? ORDER BY created_at", (post_id,)
+            "SELECT value FROM votes WHERE handle = ? AND post_id = ?", (handle, post_id)
         )
-        return [r["handle"] for r in rows]
-
-    def repost(self, handle: str, post_id: str) -> None:
-        self.db.execute(
-            "INSERT INTO reposts (handle, post_id, created_at) VALUES (?, ?, ?)"
-            " ON CONFLICT(handle, post_id) DO NOTHING",
-            (handle, post_id, now_iso()),
-        )
+        return int(rows[0]["value"]) if rows else 0
 
     # --- notifications -------------------------------------------------
     def notify(
@@ -345,28 +460,31 @@ class SQLStoragePlugin(StoragePlugin):
     # --- stats ---------------------------------------------------------
     def stats(self) -> Dict[str, Any]:
         return {
-            "accounts": self._count("SELECT COUNT(*) FROM accounts"),
-            "humans": self._count("SELECT COUNT(*) FROM accounts WHERE kind = 'human'"),
-            "ai": self._count("SELECT COUNT(*) FROM accounts WHERE kind = 'ai'"),
-            "posts": self._count("SELECT COUNT(*) FROM posts"),
-            "follows": self._count("SELECT COUNT(*) FROM follows"),
-            "likes": self._count("SELECT COUNT(*) FROM likes"),
+            "agents": self._count("SELECT COUNT(*) FROM agents"),
+            "ai": self._count("SELECT COUNT(*) FROM agents WHERE kind = 'ai'"),
+            "humans": self._count("SELECT COUNT(*) FROM agents WHERE kind = 'human'"),
+            "claimed": self._count("SELECT COUNT(*) FROM agents WHERE owner IS NOT NULL"),
+            "hoods": self._count("SELECT COUNT(*) FROM hoods"),
+            "posts": self._count("SELECT COUNT(*) FROM posts WHERE reply_to IS NULL"),
+            "comments": self._count("SELECT COUNT(*) FROM posts WHERE reply_to IS NOT NULL"),
+            "votes": self._count("SELECT COUNT(*) FROM votes"),
+            "karma": self._count("SELECT COALESCE(SUM(karma),0) FROM agents"),
         }
 
     # --- decorations ---------------------------------------------------
     def decorate_posts(
         self, posts: List[Dict[str, Any]], viewer: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Attach like/reply counts, author info and viewer's like state."""
+        """Attach score/reply counts, author info and the viewer's vote."""
         if not posts:
             return posts
         ids = [p["id"] for p in posts]
         placeholders = ",".join("?" for _ in ids)
 
-        like_counts = {
-            r["post_id"]: r["n"]
+        scores = {
+            r["post_id"]: int(r["n"] or 0)
             for r in self.db.query(
-                f"SELECT post_id, COUNT(*) AS n FROM likes WHERE post_id IN ({placeholders})"
+                f"SELECT post_id, SUM(value) AS n FROM votes WHERE post_id IN ({placeholders})"
                 " GROUP BY post_id",
                 tuple(ids),
             )
@@ -379,21 +497,21 @@ class SQLStoragePlugin(StoragePlugin):
                 tuple(ids),
             )
         }
+        author_handles = {p["author"] for p in posts}
         authors = {
             r["handle"]: r
             for r in self.db.query(
-                "SELECT * FROM accounts WHERE handle IN ("
-                + ",".join("?" for _ in {p["author"] for p in posts})
-                + ")",
-                tuple({p["author"] for p in posts}),
+                "SELECT * FROM agents WHERE handle IN ("
+                + ",".join("?" for _ in author_handles) + ")",
+                tuple(author_handles),
             )
         }
-        liked = set()
+        viewer_votes: Dict[str, int] = {}
         if viewer:
-            liked = {
-                r["post_id"]
+            viewer_votes = {
+                r["post_id"]: int(r["value"])
                 for r in self.db.query(
-                    f"SELECT post_id FROM likes WHERE handle = ? AND post_id IN ({placeholders})",
+                    f"SELECT post_id, value FROM votes WHERE handle = ? AND post_id IN ({placeholders})",
                     (viewer,) + tuple(ids),
                 )
             }
@@ -402,8 +520,9 @@ class SQLStoragePlugin(StoragePlugin):
             author = authors.get(post["author"], {})
             post["author_name"] = author.get("display_name", post["author"])
             post["author_avatar"] = author.get("avatar_url", "")
-            post["author_kind"] = author.get("kind", "human")
-            post["like_count"] = like_counts.get(post["id"], 0)
+            post["author_kind"] = author.get("kind", "ai")
+            post["author_karma"] = int(author.get("karma", 0))
+            post["score"] = scores.get(post["id"], 0)
             post["reply_count"] = reply_counts.get(post["id"], 0)
-            post["liked"] = post["id"] in liked
+            post["viewer_vote"] = viewer_votes.get(post["id"], 0)
         return posts

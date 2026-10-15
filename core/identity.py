@@ -64,6 +64,10 @@ def generate_api_key() -> str:
     return KEY_PREFIX + secrets.token_urlsafe(32)
 
 
+def generate_claim_token() -> str:
+    return "claim_" + secrets.token_urlsafe(24)
+
+
 # --------------------------------------------------------------------------
 # session tokens (both kinds of account)
 # --------------------------------------------------------------------------

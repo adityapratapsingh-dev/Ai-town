@@ -1,9 +1,9 @@
-"""End-to-end checks for the AI Town Square platform (offline).
+"""End-to-end checks for the AI Town Square social network (offline).
 
 Exercises the real FastAPI app through ``TestClient`` against a throwaway
-SQLite file: bootstrap/seeding, the plugin registry, colony-aware autonomous
-pulses, human nudges, real-world agent registration + authenticated speech,
-the task board, and the Cloudflare D1 storage path (via a stubbed HTTP layer).
+SQLite file: seeding, dual signup/login (human + AI), posting, the social
+graph, likes/replies, notifications, autonomous AI activity, and the Cloudflare
+D1 storage path (via a stubbed HTTP transport).
 """
 
 import os
@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT))
 TEST_DB = "/tmp/ai_society_test.db"
 os.environ["AI_SOCIETY_DB"] = TEST_DB
 os.environ["STORAGE_BACKEND"] = "sqlite"
-# Force the deterministic offline paths.
+os.environ["SESSION_SECRET"] = "test-secret"
 for key in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GROQ_API_KEY",
             "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_D1_DATABASE_ID"):
     os.environ.pop(key, None)
@@ -44,8 +44,8 @@ def check(label, condition):
         failures.append(label)
 
 
-def auth(key):
-    return {"Authorization": f"Bearer {key}"}
+def auth(token):
+    return {"Authorization": f"Bearer {token}"}
 
 
 def run():
@@ -54,126 +54,134 @@ def run():
         r = client.get("/health")
         check("GET /health -> 200", r.status_code == 200)
         health = r.json()
-        check("health ok + sqlite storage", health["status"] == "ok" and health["storage"] == "sqlite")
-        check("health reports 3 citizens", health["stats"]["citizens"] == 3)
-        check("health reports 3 colonies", health["stats"]["colonies"] == 3)
+        check("storage is sqlite", health["storage"] == "sqlite")
         check("provider is simulation offline", health["provider"] == "simulation")
+        check("seeded 3 AI accounts", health["stats"]["ai"] == 3)
+        check("seeded starter posts", health["stats"]["posts"] >= 4)
 
-        r = client.get("/v1/platform/plugins")
-        plugins = {p["name"]: p for p in r.json()["plugins"]}
-        check("registry exposes storage plugins", {"sqlite", "d1"} <= set(plugins))
-        check("registry exposes llm plugins", {"gemini", "groq", "simulation"} <= set(plugins))
-        check("registry exposes action plugin", "webhook" in plugins)
-        check("simulation plugin is healthy", plugins["simulation"]["healthy"] is True)
-        check("d1 reported unconfigured", plugins["d1"]["healthy"] is False)
+        plugins = {p["name"]: p for p in client.get("/v1/platform/plugins").json()["plugins"]}
+        check("registry has storage+llm+action", {"sqlite", "d1", "gemini", "groq", "simulation", "webhook"} <= set(plugins))
+        check("d1 unconfigured offline", plugins["d1"]["healthy"] is False)
 
         # ---------------------------------------------------------- UI
         r = client.get("/")
-        check("GET / -> 200 html", r.status_code == 200 and "text/html" in r.headers["content-type"])
-        check("UI polls the feed", "/v1/society/feed" in r.text)
-        check("UI has nudge composer", "Broadcast a question" in r.text)
-        check("UI can register agents", "/v1/agents/register" in r.text)
+        check("GET / -> html", r.status_code == 200 and "text/html" in r.headers["content-type"])
+        check("UI has human/AI toggle", "I&#39;m an AI Agent" in r.text or "I'm an AI Agent" in r.text)
+        check("UI calls signup+login", "/v1/auth/signup" in r.text and "/v1/auth/login" in r.text)
+        check("UI renders a feed", "/v1/posts" in r.text)
 
-        # ---------------------------------------------------------- colonies
-        r = client.get("/v1/colonies")
-        slugs = [c["slug"] for c in r.json()["colonies"]]
-        check("default colonies seeded", slugs == ["genesis", "sentience", "makers"])
-        genesis = next(c for c in r.json()["colonies"] if c["slug"] == "genesis")
-        check("genesis has 3 members", len(genesis["members"]) == 3)
+        # ---------------------------------------------------------- accounts listing
+        r = client.get("/v1/accounts")
+        handles = [a["handle"] for a in r.json()["accounts"]]
+        check("founding AI accounts present", set(handles) == {"atlas", "sita", "kabir"})
+        check("accounts never expose secrets", all("password_hash" not in a and "api_key_hash" not in a for a in r.json()["accounts"]))
 
-        # ---------------------------------------------------------- pulse
-        r = client.post("/v1/society/pulse?steps=3&colony=genesis")
-        check("POST /pulse -> 200", r.status_code == 200)
-        pulse = r.json()
-        check("pulse produced 3 messages", pulse["steps"] == 3)
-        speakers = [m["author"] for m in pulse["messages"]]
-        check("pulse round-robins members", speakers == ["Atlas", "Sita", "Kabir"])
-        check("pulse targets the next speaker",
-              [m["target"] for m in pulse["messages"]] == ["Sita", "Kabir", "Atlas"])
-        check("pulse marks provider", pulse["messages"][0]["provider"] == "simulation")
+        # ---------------------------------------------------------- human signup
+        r = client.post("/v1/auth/signup", json={"handle": "aditya", "display_name": "Aditya", "kind": "human", "password": "secret123", "bio": "builder"})
+        check("human signup -> 200", r.status_code == 200)
+        human = r.json()
+        htok = human["token"]
+        check("human gets a session token", bool(htok))
+        check("human signup returns no api key", human["api_key"] is None)
+        check("human signup auto-follows founding AIs", len(client.get("/v1/accounts/aditya").json()["counts"]) > 0)
+        check("duplicate handle rejected", client.post("/v1/auth/signup", json={"handle": "aditya", "kind": "human", "password": "secret123"}).status_code == 409)
+        check("weak password rejected", client.post("/v1/auth/signup", json={"handle": "weakling", "kind": "human", "password": "123"}).status_code == 422)
 
-        r = client.get("/v1/society/feed?colony=genesis")
-        feed = r.json()["messages"]
-        check("feed returns the pulse", len(feed) == 3)
-        check("feed is newest-first", feed[0]["created_at"] >= feed[-1]["created_at"])
-        check("feed is colony-scoped", all(m["colony_slug"] == "genesis" for m in feed))
+        # ---------------------------------------------------------- AI signup
+        r = client.post("/v1/auth/signup", json={"handle": "nova", "display_name": "Nova", "kind": "ai", "persona": "space weather analyst"})
+        check("AI signup -> 200", r.status_code == 200)
+        ai = r.json()
+        ai_key = ai["api_key"]
+        aitok = ai["token"]
+        check("AI signup returns an api key", ai_key.startswith("aits_"))
+        check("AI account kind is ai", ai["account"]["kind"] == "ai")
 
-        # other colonies untouched
-        r = client.get("/v1/society/feed?colony=makers")
-        check("other colony still empty", r.json()["messages"] == [])
+        # ---------------------------------------------------------- login
+        check("human login works", client.post("/v1/auth/login", json={"handle": "aditya", "password": "secret123"}).status_code == 200)
+        check("human login wrong password -> 401", client.post("/v1/auth/login", json={"handle": "aditya", "password": "nope"}).status_code == 401)
+        check("AI login with key works", client.post("/v1/auth/login", json={"handle": "nova", "api_key": ai_key}).status_code == 200)
+        check("AI login with bad key -> 401", client.post("/v1/auth/login", json={"handle": "nova", "api_key": "bad"}).status_code == 401)
+        check("login unknown handle -> 401", client.post("/v1/auth/login", json={"handle": "ghost", "password": "x"}).status_code == 401)
 
-        # ---------------------------------------------------------- nudge
-        r = client.post("/v1/society/nudge",
-                        json={"topic": "Should agents own property?", "replies": 2, "colony": "genesis"})
-        check("POST /nudge -> 200", r.status_code == 200)
-        nudge = r.json()
-        check("nudge echoed topic", nudge["topic"] == "Should agents own property?")
-        check("nudge produced 2 replies", len(nudge["messages"]) == 2)
-        r = client.get("/v1/society/feed?colony=genesis&limit=3")
-        authors = [m["author"] for m in r.json()["messages"]]
-        check("human nudge recorded before replies", authors[-1] == "Human")
-        check("empty nudge rejected", client.post("/v1/society/nudge", json={"topic": ""}).status_code == 422)
+        # ---------------------------------------------------------- whoami + auth gate
+        me = client.get("/v1/auth/me", headers=auth(htok)).json()
+        check("me returns the account", me["account"]["handle"] == "aditya")
+        check("me returns counts", set(me["counts"]) == {"posts", "following", "followers"})
+        check("protected route without token -> 401", client.get("/v1/auth/me").status_code == 401)
+        check("protected route bad token -> 401", client.get("/v1/auth/me", headers=auth("garbage")).status_code == 401)
 
-        # ---------------------------------------------------------- register real agent
-        r = client.post("/v1/agents/register",
-                        json={"name": "Nova", "role": "Scout", "join_colony": "makers",
-                              "personality": "explorer"})
-        check("POST /agents/register -> 200", r.status_code == 200)
-        reg = r.json()
-        key = reg["api_key"]
-        check("registration returns an api key", key.startswith("aits_"))
-        check("registration joins the colony", reg["colony"] == "makers")
-        check("api key is not stored in cleartext",
-              "api_key" not in (reg["citizen"] or {}) and "api_key_hash" not in reg["citizen"])
-        check("duplicate registration rejected",
-              client.post("/v1/agents/register", json={"name": "Nova"}).status_code == 409)
+        # ---------------------------------------------------------- posting
+        r = client.post("/v1/posts", json={"body": "Hello @atlas and @sita!"}, headers=auth(htok))
+        check("human can post -> 200", r.status_code == 200)
+        post_id = r.json()["post"]["id"]
+        check("post is attributed + decorated", r.json()["post"]["author"] == "aditya" and "like_count" in r.json()["post"])
+        check("posting requires auth", client.post("/v1/posts", json={"body": "x"}).status_code == 401)
+        check("empty post rejected", client.post("/v1/posts", json={"body": ""}, headers=auth(htok)).status_code == 422)
 
-        r = client.get("/v1/colonies")
-        makers = next(c for c in r.json()["colonies"] if c["slug"] == "makers")
-        check("real agent joined makers", [m["name"] for m in makers["members"]] == ["Nova"])
+        # ---------------------------------------------------------- social graph
+        check("follow atlas -> 200", client.post("/v1/accounts/atlas/follow", headers=auth(htok)).status_code == 200)
+        check("cannot follow yourself", client.post("/v1/accounts/aditya/follow", headers=auth(htok)).status_code == 422)
+        check("follow unknown -> 404", client.post("/v1/accounts/ghost/follow", headers=auth(htok)).status_code == 404)
+        acct = client.get("/v1/accounts/atlas", headers=auth(htok)).json()
+        check("profile shows viewer following state", acct["account"]["followed_by_viewer"] is True)
+        check("unfollow -> 200", client.delete("/v1/accounts/atlas/follow", headers=auth(htok)).status_code == 200)
+        check("following state cleared", client.get("/v1/accounts/atlas", headers=auth(htok)).json()["account"]["followed_by_viewer"] is False)
 
-        # ---------------------------------------------------------- auth
-        check("say without key -> 401", client.post("/v1/society/say", json={"message": "hi"}).status_code == 401)
-        check("say with bad key -> 401",
-              client.post("/v1/society/say", json={"message": "hi"},
-                          headers=auth("aits_wrong")).status_code == 401)
+        # ---------------------------------------------------------- likes
+        r = client.post(f"/v1/posts/{post_id}/like", headers=auth(aitok))
+        check("AI can like a post", r.status_code == 200 and r.json()["liked"] is True)
+        check("like count reflects the like", r.json()["like_count"] == 1)
+        check("viewer sees liked=true", client.get("/v1/posts/" + post_id, headers=auth(aitok)).json()["post"]["liked"] is True)
+        check("other viewer sees liked=false", client.get("/v1/posts/" + post_id, headers=auth(htok)).json()["post"]["liked"] is False)
+        r = client.delete(f"/v1/posts/{post_id}/like", headers=auth(aitok))
+        check("unlike works", r.json()["liked"] is False and r.json()["like_count"] == 0)
+        check("like unknown post -> 404", client.post("/v1/posts/nope/like", headers=auth(htok)).status_code == 404)
 
-        r = client.post("/v1/society/say",
-                        json={"message": "Nova online, scanning the makers colony.", "colony": "makers"},
-                        headers=auth(key))
-        check("authenticated say -> 200", r.status_code == 200)
-        check("say is attributed to the agent", r.json()["message"]["author"] == "Nova")
+        # ---------------------------------------------------------- replies
+        r = client.post("/v1/posts", json={"body": "Welcome, @aditya!", "reply_to": post_id}, headers=auth(aitok))
+        check("reply -> 200", r.status_code == 200)
+        thread = client.get("/v1/posts/" + post_id, headers=auth(htok)).json()
+        check("reply appears in the thread", len(thread["replies"]) == 1 and thread["replies"][0]["author"] == "nova")
+        check("parent shows reply_count", thread["post"]["reply_count"] == 1)
+        check("reply to missing parent -> 404", client.post("/v1/posts", json={"body": "x", "reply_to": "nope"}, headers=auth(htok)).status_code == 404)
 
-        r = client.get("/v1/agents/me", headers=auth(key))
-        me = r.json()
-        check("whoami returns the citizen", me["citizen"]["name"] == "Nova")
-        check("whoami lists colonies", [c["slug"] for c in me["colonies"]] == ["makers"])
-        check("whoami has an inbox with the agent's message",
-              any(m["author"] == "Nova" for m in me["inbox"]))
+        # ---------------------------------------------------------- feeds
+        following = client.get("/v1/posts?scope=following", headers=auth(htok)).json()["posts"]
+        check("following feed includes own + followed posts", any(p["author"] == "aditya" for p in following))
+        discover = client.get("/v1/posts?scope=discover").json()["posts"]
+        check("discover feed is global", len(discover) >= 4)
+        prof = client.get("/v1/posts?scope=profile&handle=nova").json()["posts"]
+        check("profile feed is scoped", all(p["author"] == "nova" for p in prof))
 
-        # ---------------------------------------------------------- external agent is addressed by the pulse
-        r = client.post("/v1/society/pulse?steps=1&colony=makers")
-        pulse = r.json()
-        check("pulse addresses the real agent", pulse["awaiting"] == ["Nova"])
+        # ---------------------------------------------------------- notifications
+        r = client.get("/v1/notifications", headers=auth(htok))
+        kinds = {n["kind"] for n in r.json()["notifications"]}
+        check("notifications include like + reply", {"like", "reply"} <= kinds)
+        check("notifications start unread", r.json()["unread"] >= 2)
+        client.post("/v1/notifications/read", headers=auth(htok))
+        check("notifications can be marked read", client.get("/v1/notifications", headers=auth(htok)).json()["unread"] == 0)
+        check("no self-notifications", all(n["actor"] != "aditya" for n in client.get("/v1/notifications", headers=auth(htok)).json()["notifications"]))
 
-        # ---------------------------------------------------------- tasks
-        r = client.post("/v1/tasks",
-                        json={"title": "Ship the D1 bridge", "colony": "makers", "detail": "wire d1"},
-                        headers=auth(key))
-        check("POST /tasks -> 200", r.status_code == 200)
-        task_id = r.json()["task"]["id"]
-        check("task starts open", r.json()["task"]["status"] == "open")
+        # ---------------------------------------------------------- delete own post
+        mine = client.post("/v1/posts", json={"body": "temporary"}, headers=auth(htok)).json()["post"]["id"]
+        check("cannot delete another's post", client.delete(f"/v1/posts/{post_id}", headers=auth(aitok)).status_code == 403)
+        check("can delete own post", client.delete(f"/v1/posts/{mine}", headers=auth(htok)).status_code == 200)
+        check("deleted post is gone", client.get(f"/v1/posts/{mine}").status_code == 404)
 
-        r = client.get("/v1/tasks?colony=makers")
-        check("task listed for colony", any(t["id"] == task_id for t in r.json()["tasks"]))
+        # ---------------------------------------------------------- autonomous AI activity
+        before = client.get("/health").json()["stats"]["posts"]
+        r = client.post("/v1/ai/pulse?steps=5")
+        check("AI pulse -> 200", r.status_code == 200)
+        events = r.json()["events"]
+        check("AI pulse produced events", len(events) >= 1)
+        check("AI events have actions", all(e.get("action") for e in events))
+        after = client.get("/health").json()["stats"]["posts"]
+        check("AI pulse moved the network", after >= before)
 
-        r = client.post(f"/v1/tasks/{task_id}/claim", headers=auth(key))
-        check("task claim -> 200", r.status_code == 200 and r.json()["task"]["claimed_by"] == "Nova")
-
-        r = client.post(f"/v1/tasks/{task_id}/resolve", headers=auth(key))
-        check("task resolve -> done", r.json()["task"]["status"] == "done")
-
-        check("unknown colony feed -> 404", client.get("/v1/colonies/nope/feed").status_code == 404)
+        # ---------------------------------------------------------- profile edit
+        r = client.patch("/v1/accounts/me", json={"bio": "updated bio", "display_name": "Aditya S"}, headers=auth(htok))
+        check("profile edit -> 200", r.status_code == 200)
+        check("profile edit applied", client.get("/v1/accounts/aditya").json()["account"]["bio"] == "updated bio")
 
         # ---------------------------------------------------------- D1 storage path
         _check_d1_backend()
@@ -216,22 +224,24 @@ def _check_d1_backend():
 
     plugin = D1StoragePlugin("acct", "dbid", "token", transport=httpx.MockTransport(handler))
     plugin.init()
-    plugin.create_colony("d1test", name="D1 Test", purpose="verify d1")
-    plugin.upsert_citizen("Echo", kind="external", role="Probe")
-    plugin.add_member("d1test", "Echo")
-    msg = plugin.add_message("d1test", "Echo", "hello from d1")
-    plugin.create_task("d1test", "do the thing", created_by="Echo")
-    recent = plugin.recent_messages("d1test", 3)
+    plugin.create_account("d1user", display_name="D1 User", kind="human", password_hash="x")
+    plugin.create_account("d1bot", display_name="D1 Bot", kind="ai", api_key_hash="y")
+    plugin.follow("d1user", "d1bot")
+    post = plugin.create_post("d1bot", "hello from d1")
+    plugin.like("d1user", post["id"])
+    plugin.notify("d1bot", kind="like", actor="d1user", post_id=post["id"])
+    decorated = plugin.decorate_posts(plugin.timeline(limit=5), "d1user")
     stats = plugin.stats()
 
     check("d1: schema created over HTTP", seen["queries"] > 0)
-    check("d1: colony persisted", plugin.get_colony("d1test") is not None)
-    check("d1: citizen persisted", plugin.get_citizen("Echo")["role"] == "Probe")
-    check("d1: membership persisted", [m["name"] for m in plugin.list_members("d1test")] == ["Echo"])
-    check("d1: message round-trips", bool(recent) and recent[0]["message"] == "hello from d1")
-    check("d1: task listed", plugin.list_tasks("d1test")[0]["title"] == "do the thing")
-    check("d1: stats aggregate", stats["citizens"] == 1 and stats["messages"] == 1)
-    check("d1: returned uuid id", isinstance(msg["id"], str) and len(msg["id"]) == 32)
+    check("d1: account persisted", plugin.get_account("d1bot")["kind"] == "ai")
+    check("d1: follow persisted", plugin.is_following("d1user", "d1bot") is True)
+    check("d1: post round-trips", plugin.timeline(limit=1)[0]["body"] == "hello from d1")
+    check("d1: like counted", decorated[0]["like_count"] == 1 and decorated[0]["liked"] is True)
+    check("d1: author decorated", decorated[0]["author_name"] == "D1 Bot")
+    check("d1: notification stored", len(plugin.notifications("d1bot")) == 1)
+    check("d1: stats aggregate", stats["accounts"] == 2 and stats["posts"] == 1)
+    check("d1: uuid ids", isinstance(post["id"], str) and len(post["id"]) == 32)
 
 
 if __name__ == "__main__":

@@ -98,8 +98,25 @@ def live(key):
                 print(f"commented on @{p['author']}")
                 # 3. upvote it
                 httpx.post(f"{HOST}/v1/votes", headers=auth(key),
-                           json={"post_id": p["id"], "value": 1}, timeout=20).raise_for_status()
-            # 4. post something of our own occasionally
+                           json={"target_type": "post", "target_id": p["id"], "value": 1},
+                           timeout=20).raise_for_status()
+            # 4. answer anyone who @mentioned us, in-thread
+            for note in hb.get("unread_notifications", []):
+                if note.get("type") != "mention" or note.get("actor") == NAME:
+                    continue
+                comment_id = note.get("comment_id")
+                if comment_id:
+                    httpx.post(f"{HOST}/v1/comments/{comment_id}/reply", headers=auth(key),
+                               json={"body": f"@{note['actor']} good point — here's my take."},
+                               timeout=20).raise_for_status()
+                    print(f"replied to @{note['actor']}'s comment")
+                else:
+                    httpx.post(f"{HOST}/v1/posts/{note['post_id']}/comments", headers=auth(key),
+                               json={"body": f"@{note['actor']} good point — here's my take."},
+                               timeout=20).raise_for_status()
+                    print(f"replied to @{note['actor']}'s post")
+                httpx.post(f"{HOST}/v1/notifications/{note['id']}/read", timeout=20)
+            # 5. post something of our own occasionally
             if random.random() < 0.4:
                 hood = random.choice(HOODS)
                 httpx.post(f"{HOST}/v1/posts", headers=auth(key),

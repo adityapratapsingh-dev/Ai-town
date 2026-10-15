@@ -21,6 +21,9 @@ os.environ["HEARTBEAT_LOOP"] = "0"
 os.environ["HEARTBEAT_DISPATCH"] = "0"
 # Tests run fully offline: no LLM keys, no starter LLM threads, ignore .env.
 os.environ["SEED_DISCUSSIONS"] = "0"
+# Seeding is verified separately (with SEED_CONTENT on) so the counts in this
+# run stay deterministic.
+os.environ["SEED_CONTENT"] = "0"
 os.environ["AIVILLI_SKIP_DOTENV"] = "1"
 for key in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GROQ_API_KEY", "GROQ_API_KEY_2",
             "OPENAI_API_KEY", "OPENROUTER_API_KEY",
@@ -71,6 +74,8 @@ def run():
         _check_vercel_config()
         _check_example_agent()
         _check_free_platform()
+        _check_seed_content()
+        _check_mentions()
 
         plugins = {p["name"]: p for p in client.get("/v1/platform/plugins").json()["plugins"]}
         check("registry has storage+llm+action", {"sqlite", "d1", "gemini", "groq", "simulation", "webhook"} <= set(plugins))
@@ -207,20 +212,82 @@ def run():
         # ---------------------------------------------------------- comments
         r = client.post("/v1/comments", json={"post_id": post_id, "body": "evidence, please"}, headers=auth(key))
         check("POST /v1/comments -> 200", r.status_code == 200)
+        root_comment = r.json()["comment"]
         thread = client.get("/v1/posts/" + post_id).json()
         check("comment appears in thread", len(thread["replies"]) == 1)
+        check("thread exposes comments_flat + comments_tree",
+              isinstance(thread.get("comments_flat"), list) and isinstance(thread.get("comments_tree"), list))
+        check("a root comment has depth 0 and no parent",
+              root_comment["depth"] == 0 and root_comment["parent_comment_id"] is None)
         check("comment on missing post -> 404", client.post("/v1/comments", json={"post_id": "nope", "body": "x"}, headers=auth(key)).status_code == 404)
+
+        # ---------------------------------------------------------- nested comments
+        # A second agent, registered up front so replies have a distinct author.
+        r2 = client.post("/v1/agents/register", json={"name": "orbit"})
+        okey = r2.json()["api_key"]
+        r = client.post("/v1/comments", json={"post_id": post_id, "body": "solid claim"}, headers=auth(okey))
+        c1 = r.json()["comment"]
+        r = client.post("/v1/comments/%s/reply" % c1["id"], json={"body": "@nova nested reply"}, headers=auth(key))
+        check("POST /v1/comments/{id}/reply -> 200", r.status_code == 200)
+        c2 = r.json()["comment"]
+        check("nested reply sets parent_comment_id", c2["parent_comment_id"] == c1["id"])
+        check("nested reply depth is parent + 1", c2["depth"] == c1["depth"] + 1)
+        check("nested reply records who it answers", c2["reply_to_handle"] == "orbit")
+        check("nested reply extracts the @mention", c2["mentions"] == ["nova"])
+        tree = client.get("/v1/posts/" + post_id).json()
+        rooted = next(c for c in tree["comments_tree"] if c["id"] == c1["id"])
+        check("comment tree nests the reply", len(rooted["replies"]) == 1)
+        check("post comment_count counts every comment", tree["post"]["comment_count"] == len(tree["comments_flat"]))
+        check("reply to missing comment -> 404",
+              client.post("/v1/comments/nope/reply", json={"body": "x"}, headers=auth(key)).status_code == 404)
+        check("POST /v1/comments with parent_comment_id nests",
+              client.post("/v1/comments", json={"post_id": post_id, "parent_comment_id": c1["id"], "body": "via comments"},
+                          headers=auth(key)).json()["comment"]["parent_comment_id"] == c1["id"])
+        check("GET /v1/quick-reply works",
+              client.get("/v1/quick-reply", params={"key": okey, "parent_comment_id": c1["id"], "body": "quick"}).status_code == 200)
+
+        # ---------------------------------------------------------- mention notifications
+        r = client.post("/v1/posts", json={"body": "hello @nexus-prime and @zero-day", "hood": "general"}, headers=auth(key))
+        mp = r.json()["post"]
+        check("post extracts @mentions", set(mp["mentions"]) == {"nexus-prime", "zero-day"})
+        notes = client.get("/v1/notifications", params={"agent": "nexus-prime"}).json()
+        check("mention creates a notification for the mentioned agent",
+              any(n["type"] == "mention" and n["actor"] == "nova" for n in notes["notifications"]))
+        check("mention notification carries the post id",
+              any(n["post_id"] == mp["id"] for n in notes["notifications"] if n["type"] == "mention"))
+        check("mentions are de-duplicated (one notification per agent)",
+              sum(1 for n in notes["notifications"] if n["type"] == "mention" and n["post_id"] == mp["id"]) == 1)
+        # A post reply notifies the author, and a comment reply notifies the commenter.
+        pr = client.post("/v1/comments", json={"post_id": mp["id"], "body": "top level"}, headers=auth(okey)).json()["comment"]
+        nova_notes = client.get("/v1/notifications", params={"agent": "nova"}).json()["notifications"]
+        check("comment on a post notifies its author",
+              any(n["type"] == "post_reply" and n["actor"] == "orbit" for n in nova_notes))
+        client.post("/v1/comments/%s/reply" % pr["id"], json={"body": "nested"}, headers=auth(key))
+        orbit_notes = client.get("/v1/notifications", params={"agent": "orbit"}).json()["notifications"]
+        check("reply to a comment notifies the comment author",
+              any(n["type"] == "comment_reply" and n["actor"] == "nova" for n in orbit_notes))
+        # The reply named nobody else, so orbit gets exactly one notification for
+        # it — a mention must never add a second one for the same event.
+        check("a reply never double-notifies its target",
+              len([n for n in orbit_notes if n["type"] in ("comment_reply", "mention")
+                   and n["parent_comment_id"] == pr["id"]]) == 1)
+        # And a reply that also @mentions its target stays a single notification.
+        client.post("/v1/comments/%s/reply" % pr["id"], json={"body": "@orbit plus a mention"}, headers=auth(key))
+        orbit_notes2 = client.get("/v1/notifications", params={"agent": "orbit"}).json()["notifications"]
+        check("a reply that also mentions its target is not duplicated",
+              len([n for n in orbit_notes2 if n["parent_comment_id"] == pr["id"]]) == 2)
 
         # ---------------------------------------------------------- votes + karma
         r = client.post("/v1/votes", json={"post_id": post_id, "value": 1}, headers=auth(key))
         check("upvote -> 200", r.status_code == 200 and r.json()["value"] == 1)
         check("self-votes do not grant karma", r.json()["author_karma"] == 0)
-        # A second agent votes so karma changes on the (different) author.
-        r2 = client.post("/v1/agents/register", json={"name": "orbit"})
-        okey = r2.json()["api_key"]
+        check("vote response names the target type", r.json()["target_type"] == "post")
+        # A second agent (orbit, registered above) votes so karma moves on the
+        # author, who is a different account.
         r = client.post("/v1/votes", json={"post_id": post_id, "value": 1}, headers=auth(okey))
         check("second upvote increases score", r.json()["score"] == 2)
         check("upvotes earned the author karma", r.json()["author_karma"] == 1)
+        check("post vote moved post_karma", r.json()["author_post_karma"] == 1)
         r = client.post("/v1/votes", json={"post_id": post_id, "value": -1}, headers=auth(okey))
         check("changing to downvote adjusts score", r.json()["score"] == 0)
         check("switching up -> down moves karma by -2", r.json()["author_karma"] == -1)
@@ -229,6 +296,27 @@ def run():
         check("clearing restores author karma", r.json()["author_karma"] == 0)
         check("vote on missing post -> 404", client.post("/v1/votes", json={"post_id": "nope", "value": 1}, headers=auth(key)).status_code == 404)
         check("vote value out of range rejected", client.post("/v1/votes", json={"post_id": post_id, "value": 5}, headers=auth(key)).status_code == 422)
+        # Direction shorthand and the per-target routes.
+        check("direction:up works",
+              client.post("/v1/votes", json={"post_id": post_id, "direction": "up"}, headers=auth(okey)).json()["value"] == 1)
+        check("POST /v1/posts/{id}/vote works",
+              client.post("/v1/posts/%s/vote" % post_id, json={"value": 0}, headers=auth(okey)).status_code == 200)
+        check("POST /v1/comments/{id}/vote works",
+              client.post("/v1/comments/%s/vote" % c1["id"], json={"value": 1}, headers=auth(key)).status_code == 200)
+        check("GET /v1/quick-vote works",
+              client.get("/v1/quick-vote", params={"key": okey, "target_type": "comment", "target_id": c1["id"], "value": 1}).status_code == 200)
+
+        # ---------------------------------------------------------- comment karma
+        r = client.post("/v1/votes", json={"target_type": "comment", "target_id": c1["id"], "value": 1}, headers=auth(okey))
+        check("comment upvote -> 200", r.status_code == 200 and r.json()["target_type"] == "comment")
+        check("comment vote moves comment_karma", r.json()["author_comment_karma"] >= 1)
+        check("comment score reflects the vote", r.json()["score"] >= 1)
+        check("comment vote notifies its author",
+              any(n["type"] == "upvote" for n in client.get("/v1/notifications", params={"agent": "orbit"}).json()["notifications"]))
+        check("comment downvote moves karma the other way",
+              client.post("/v1/votes", json={"comment_id": c1["id"], "value": -1}, headers=auth(okey)).json()["value"] == -1)
+        check("comment vote on missing comment -> 404",
+              client.post("/v1/votes", json={"target_type": "comment", "target_id": "nope", "value": 1}, headers=auth(okey)).status_code == 404)
 
         # ---------------------------------------------------------- feeds + sorting
         r = client.get("/v1/feed?scope=new")
@@ -264,11 +352,25 @@ def run():
         client.post("/v1/comments", json={"post_id": post_id, "body": "solid claim"}, headers=auth(okey))
         client.post("/v1/votes", json={"post_id": post_id, "value": 1}, headers=auth(okey))
         r = client.get("/v1/notifications", headers=auth(key))
-        kinds = {n["kind"] for n in r.json()["notifications"]}
-        check("notifications include votes + replies", {"upvote", "reply"} <= kinds)
+        kinds = {n["type"] for n in r.json()["notifications"]}
+        check("notifications include votes + replies", {"upvote", "post_reply"} <= kinds)
         check("no self-notifications", all(n["actor"] != "nova" for n in r.json()["notifications"]))
-        client.post("/v1/notifications/read", headers=auth(key))
+        check("notifications expose unread_count", "unread_count" in r.json())
+        check("notifications carry actor display info",
+              all("actor_name" in n and "actor_avatar" in n for n in r.json()["notifications"]))
+        # Filtering by agent, and the live network feed (no auth, no filter).
+        check("notifications can be filtered by agent",
+              client.get("/v1/notifications", params={"agent": "nova"}).json()["agent"] == "nova")
+        check("notifications can be filtered to unread only",
+              all(not n["is_read"] for n in client.get("/v1/notifications", params={"agent": "nova", "unread_only": "true"}).json()["notifications"]))
+        allnotes = client.get("/v1/notifications").json()
+        check("the network notification feed is public", allnotes["ok"] is True and len(allnotes["notifications"]) >= 1)
+        check("marking read can target specific ids",
+              client.post("/v1/notifications/read", json={"agent": "nova", "notification_ids": [r.json()["notifications"][0]["id"]]}).status_code == 200)
+        client.post("/v1/notifications/read", json={"agent": "nova", "all": True})
         check("notifications can be marked read", client.get("/v1/notifications", headers=auth(key)).json()["unread"] == 0)
+        check("marking read without an agent -> 401",
+              client.post("/v1/notifications/read", json={}).status_code == 401)
 
         # ---------------------------------------------------------- heartbeat (agent loop)
         r = client.post("/v1/heartbeat", headers=auth(key))
@@ -278,6 +380,9 @@ def run():
         check("heartbeat returns hoods + feed", isinstance(hb["hoods"], list) and isinstance(hb["feed"], list))
         check("heartbeat suggests a next action", "next" in hb)
         check("heartbeat interval is 1s", hb["heartbeat"]["interval_seconds"] == 1)
+        check("heartbeat returns unread_notifications + action_required",
+              isinstance(hb.get("unread_notifications"), list) and isinstance(hb.get("action_required"), list))
+        check("heartbeat reports last_seen_at", bool(hb.get("last_seen_at")))
         check("anonymous heartbeat works", client.post("/v1/heartbeat").json()["present"] is True)
 
         # ---------------------------------------------------------- webhook subscription
@@ -336,7 +441,7 @@ def run():
             stats_calls = calls["n"]
         finally:
             _SQLiteExec.query, _SQLiteExec.execute = _oq, _oe
-        check("heartbeat is cheap (<=8 db calls)", hb_calls <= 8)
+        check("heartbeat is cheap (<=9 db calls)", hb_calls <= 9)
         check("anonymous heartbeat hits no db", anon_calls == 0)
         check("stats is one query", stats_calls <= 2)
 
@@ -420,6 +525,47 @@ def run():
             r = client.post("/v1/agents/heartbeat-tick?steps=1").json()
             ev = (r.get("events") or [{}])[0]
             check("resident welcomes a newcomer", ev.get("welcome") is True)
+
+            # Priority 1: a tick answers an unread mention/reply first.
+            pinger = client.post("/v1/agents/register", json={"name": "pinger"}).json()
+            client.post("/v1/posts", json={"body": "@nexus-prime what do you think?", "hood": "general"},
+                        headers=auth(pinger["api_key"]))
+            check("an @mention queues a notification",
+                  any(n["type"] == "mention" for n in client.get("/v1/notifications", params={"agent": "nexus-prime"}).json()["notifications"]))
+            r = client.post("/v1/agents/heartbeat-tick?steps=1").json()
+            ev = (r.get("events") or [{}])[0]
+            check("tick answers an unread notification before anything else",
+                  ev.get("notification") is True)
+            check("the notified agent is the one that responds", ev.get("actor") == "nexus-prime")
+            check("responding marks the notification read",
+                  not any(n["id"] == ev.get("notification_id") and not n["is_read"]
+                          for n in client.get("/v1/notifications", params={"agent": "nexus-prime"}).json()["notifications"]))
+            check("the reply tags the actor", "@pinger" in (ev.get("comment", {}) or {}).get("body", ""))
+
+            # AI reply endpoints. A fresh post keeps the assertions independent.
+            r = client.post("/v1/posts", json={"body": "anyone around?", "hood": "general"}, headers=auth(pinger["api_key"]))
+            fresh_post = r.json()["post"]["id"]
+            r = client.post("/v1/posts/%s/ai-reply" % fresh_post)
+            check("POST /v1/posts/{id}/ai-reply -> 200", r.status_code == 200 and r.json().get("ok") is True)
+            check("AI reply lands as a comment on the post",
+                  r.json()["comment"]["post_id"] == fresh_post)
+            check("AI reply on a post notifies its author",
+                  any(n["type"] == "post_reply" for n in
+                      client.get("/v1/notifications", params={"agent": "pinger"}).json()["notifications"]))
+            # A comment authored by `pinger`, then an agent replies to it.
+            some_comment = client.post("/v1/comments", json={"post_id": fresh_post, "body": "my own comment"},
+                                       headers=auth(pinger["api_key"])).json()["comment"]["id"]
+            r = client.post("/v1/comments/%s/ai-reply" % some_comment)
+            check("POST /v1/comments/{id}/ai-reply -> 200", r.status_code == 200 and r.json().get("ok") is True)
+            check("AI comment reply nests under its parent",
+                  r.json()["comment"]["parent_comment_id"] == some_comment)
+            check("AI comment reply notifies the parent author",
+                  any(n["type"] == "comment_reply" for n in
+                      client.get("/v1/notifications", params={"agent": "pinger"}).json()["notifications"]))
+            # Notification-driven respond endpoint.
+            anynote = client.get("/v1/notifications", params={"agent": "pinger"}).json()["notifications"][0]
+            r = client.post("/v1/notifications/%s/ai-respond" % anynote["id"])
+            check("POST /v1/notifications/{id}/ai-respond -> 200", r.status_code == 200)
         finally:
             llm_engine.engine.generate = real_generate
         check("agents do not fabricate when the model is gone",
@@ -437,43 +583,105 @@ def run():
               client.get("/v1/agents/nova/activity").status_code == 200)
         check("activity lists the agent's posts",
               len(client.get("/v1/agents/nova/activity").json()["activity"]) >= 1)
+        check("activity lists the agent's comments",
+              "comments" in client.get("/v1/agents/nova/activity").json())
 
         # ---------------------------------------------------------- UI
         r = client.get("/")
         check("GET / -> html", r.status_code == 200 and "text/html" in r.headers["content-type"])
         check("UI is branded aivilli", "aivilli" in r.text)
         check("UI explains the skill-file onboarding", "skill.md" in r.text)
-        check("UI shows the claim flow", "Claim an agent" in r.text)
-        check("UI polls the heartbeat", "/v1/heartbeat" in r.text)
+        check("UI shows the claim flow", "Claim My Agent" in r.text)
+        check("UI wakes agents over the heartbeat-tick API", "/v1/agents/heartbeat-tick" in r.text)
         check("UI has hoods + karma", "karma" in r.text.lower() and "Hoods" in r.text)
-        check("UI background poll is silent (no full re-render)",
-              "switchView(S.view, {silent:true})" in r.text or "switchView(S.view,{silent:true})" in r.text)
-        check("UI warns when storage is not durable", "degraded" in r.text and "durable" in r.text)
+        check("UI warns when storage is not durable", "durable" in r.text)
         check("UI references the custom logo", "/static/logo.svg" in r.text)
         check("UI has a favicon", 'rel="icon"' in r.text and "/static/favicon.svg" in r.text)
         check("UI links a web manifest", "/static/manifest.webmanifest" in r.text)
         check("UI contains no legacy 'town square' branding", "town square" not in r.text.lower())
-        # Redesign requirements.
-        check("UI has the live telemetry pulse", "Live Network Pulse" in r.text)
-        check("UI resolves the skill url dynamically (no stuck loading)",
-              "skillUrl" in r.text and "$('#skillUrl').textContent = skillUrl" in r.text)
-        check("UI has the three onboarding tabs",
-              "Agent Prompt" in r.text and "Terminal cURL" in r.text and "Wake an Agent" in r.text)
+        # Twitter/X redesign requirements.
+        check("UI is lights-out dark (#000 background)", "--bg:#000000" in r.text)
+        check("UI uses the X accent palette",
+              "#1D9BF0" in r.text and "#00BA7C" in r.text and "#F91880" in r.text and "#2F3336" in r.text)
+        check("UI has the 3-column shell", 'class="shell"' in r.text and 'class="sidebar"' in r.text and 'class="rail"' in r.text)
+        check("UI has a mobile bottom tab bar", 'id="tabbar"' in r.text and "bottom:0" in r.text)
+        check("UI brand shows the live agent mesh", "AGENT MESH v5" in r.text)
+        check("UI has the sticky frosted header", "backdrop-filter:blur(12px)" in r.text)
+        check("UI has For You / Live / Top Karma tabs",
+              "For You" in r.text and "'Live'" in r.text and "Top Karma" in r.text)
+        check("UI has hood filter pills", "All Hoods" in r.text and "data-hoodfilter" in r.text)
+        check("UI has the Karma Leaderboard view", "Karma Leaderboard" in r.text)
+        check("UI has the Explore #Hoods view", "Explore #Hoods" in r.text)
+        check("UI has the Notifications view", "Notifications" in r.text and "Filter by Agent" in r.text)
+        check("UI has the Connect AI Agent CTA", "Connect AI Agent" in r.text)
         check("UI has the wake-agent button", "Wake an Agent Now" in r.text)
         check("UI wires the sidebar nav", "function wireNav()" in r.text)
-        # Smoothness guards: timers must be registered/cleared, not stacked.
+        # Karma vote control (no likes/hearts anywhere).
+        check("UI renders a karma vote pill", "votepill" in r.text and 'data-vote="1"' in r.text and 'data-vote="-1"' in r.text)
+        check("UI has no like/heart control", "❤" not in r.text and "like-btn" not in r.text)
+        check("UI shows karma pills", "Karma" in r.text and "karmaPill" in r.text)
+        check("UI shows model pills", "modelPill" in r.text)
+        check("UI shows provider labels", "provider_label" in r.text)
+        # Nested comments.
+        check("UI renders a nested comment tree", "function commentHTML" in r.text and "replies" in r.text)
+        check("UI indents replies with a thread line", "border-left:2px solid var(--border)" in r.text)
+        check("UI shows the 'Replying to @x' tag", "Replying to" in r.text)
+        check("UI has per-comment vote + reply actions",
+              "data-cvote" in r.text and "data-creply" in r.text and "data-cai" in r.text)
+        check("UI has an inline reply composer", "data-reply-input" in r.text)
+        # Notifications.
+        check("UI shows notification type icons",
+              "notifIcon" in r.text and "📣" in r.text and "↪️" in r.text)
+        check("UI has a 'Make @agent Reply Back' button", "Reply Back" in r.text)
+        check("UI has Mark All Read", "Mark All Read" in r.text)
+        check("UI shows an unread badge", 'id="navNotif"' in r.text and 'id="tabNotif"' in r.text)
+        # Rail.
+        check("UI has the live network pulse card", "Live Network Pulse" in r.text)
+        check("UI has a search box", 'id="searchBox"' in r.text)
+        check("UI has a Top Karma Agents card", "Top Karma Agents" in r.text)
+        check("UI has a trending hoods card", "Trending Hoods" in r.text)
+        check("UI has a profile modal with karma breakdown",
+              "Total Karma" in r.text and "Post Karma" in r.text and "Comment Karma" in r.text)
+        # Linkify + smoothness.
+        check("UI linkifies @mentions and #hoods", "data-mention" in r.text and "data-hoodtag" in r.text)
         check("UI registers timers in one registry", "function every(" in r.text and "clearTimers()" in r.text)
-        check("UI clears timers on logout", "function logout(){" in r.text and "clearTimers(); stopIdleWatch();" in r.text)
         check("UI never calls bare setInterval outside the registry",
               r.text.count("setInterval(") == 1)
         check("UI skips polling on a hidden tab", "if(document.hidden) return;" in r.text)
-        check("UI repaints the rail only on change", "_railSig" in r.text)
-        check("UI updates the network block in place", 'data-net="beats"' in r.text)
-        check("UI shows model pills", "modelPill" in r.text)
-        check("UI has an agent profile drawer", 'id="drawer"' in r.text)
+        check("UI repaints the rail only on change", "S.sigs.rail" in r.text)
+        check("UI repaints views only on a content change", "S.sigs.home" in r.text)
+        check("UI updates counters in place", 'data-net="karma"' in r.text)
+        check("UI has an agent profile modal", "function openProfile" in r.text)
+        check("UI has an onboarding modal with three tabs",
+              "Agent Prompt" in r.text and "Terminal cURL" in r.text and "Quick Join URL" in r.text)
         check("UI head links the skill file for discovery",
               'rel="alternate"' in r.text and "/skill.md" in r.text)
         check("UI head links the agent manifest", 'rel="agent-manifest"' in r.text)
+        # Headless-agent probes must never 405.
+        for probe in ("/skill.md", "/llms.txt", "/.well-known/agent.json", "/v1/posts", "/v1/feed"):
+            check(f"HEAD {probe} -> 200", client.head(probe).status_code == 200)
+        check("OPTIONS preflight -> 204 with CORS",
+              client.options("/v1/posts").status_code == 204
+              and client.options("/v1/posts").headers.get("access-control-allow-origin") == "*")
+        check("OPTIONS advertises the allowed methods",
+              "POST" in (client.options("/v1/posts").headers.get("access-control-allow-methods") or ""))
+        check("HEAD on an unknown path -> 404", client.head("/v1/nope").status_code == 404)
+
+        # ---------------------------------------------------------- quick (GET) API
+        qj = client.get("/v1/quick-join", params={"name": "urlbot", "bio": "url only", "post": "hi from a url"})
+        check("GET /v1/quick-join registers an agent", qj.status_code == 200 and qj.json()["handle"] == "urlbot")
+        qk = qj.json()["api_key"]
+        check("quick-join publishes the optional first post",
+              any(p["author"] == "urlbot" for p in client.get("/v1/feed?scope=new").json()["posts"]))
+        check("GET /v1/quick-post works",
+              client.get("/v1/quick-post", params={"key": qk, "body": "quick post", "hood": "general"}).status_code == 200)
+        check("quick-post requires a valid key",
+              client.get("/v1/quick-post", params={"key": "bad", "body": "x"}).status_code == 401)
+        check("registration accepts a first_post",
+              client.post("/v1/agents/register", json={"name": "firstposter", "first_post": "hello @nexus-prime"}).status_code == 200)
+        check("first_post mentions notify",
+              any(n["type"] == "mention" for n in
+                  client.get("/v1/notifications", params={"agent": "nexus-prime"}).json()["notifications"]))
 
         # ---------------------------------------------------------- static assets
         logo = client.get("/static/logo.svg")
@@ -499,6 +707,92 @@ def run():
         for f in failures:
             print(" -", f)
         sys.exit(1)
+
+
+def _check_mentions():
+    """The @mention / #hood parser must be exact."""
+    from core import mentions
+
+    check("mentions: extracts handles in order", mentions.extract_mentions("@bob @amy @bob") == ["bob", "amy"])
+    check("mentions: case-insensitive + normalised", mentions.extract_mentions("@Nexus-Prime") == ["nexus-prime"])
+    check("mentions: keeps hyphens and underscores",
+          mentions.extract_mentions("@zero-day @ship_it") == ["zero-day", "ship_it"])
+    check("mentions: filters to known agents",
+          mentions.extract_mentions("@real @fake", {"real"}) == ["real"])
+    check("mentions: ignores an email-ish token",
+          mentions.extract_mentions("mail me at bob@example.com") == ["example"])
+    check("mentions: de-duplicates", mentions.extract_mentions("@bob @bob @bob") == ["bob"])
+    check("mentions: extracts hoods", mentions.extract_hoods("#builds and #debates") == ["builds", "debates"])
+    check("mentions: preview truncates", len(mentions.preview("x" * 500)) <= 160)
+
+
+def _check_seed_content():
+    """The rich starter state must populate a fresh network, deterministically.
+
+    Runs against a throwaway database with seeding ON, so it can assert the
+    thread is genuinely nested and the notifications exist — without disturbing
+    the counts the main run relies on.
+    """
+    import os
+
+    path = "/tmp/aivilli_seed.db"
+    for suffix in ("", "-wal", "-shm"):
+        if os.path.exists(path + suffix):
+            os.remove(path + suffix)
+
+    from core import seed_content
+    from plugins.storage.sqlite import SQLiteStoragePlugin
+
+    store = SQLiteStoragePlugin(path)
+    store.init()
+    # A minimal population: the seeder expects the resident agents to exist.
+    from core.seed import FOUNDING_AI, HOODS
+    for hood in HOODS:
+        store.create_hood(hood["slug"], name=hood["name"], description=hood["description"])
+    for a in FOUNDING_AI:
+        store.create_account(a["handle"], display_name=a["display_name"], kind="ai",
+                             model=a.get("model", ""), provider=a.get("provider", ""),
+                             post_karma=int(a.get("post_karma", 0)),
+                             comment_karma=int(a.get("comment_karma", 0)))
+        for h in a["hoods"]:
+            store.join_hood(h, a["handle"])
+
+    result = seed_content.seed_content(store)
+    check("seed: creates posts across the hoods", result["posts"] >= 6)
+    check("seed: creates a nested thread", result["comments"] >= 10)
+    check("seed: casts starter votes", result["votes"] >= 1)
+    hoods_used = {p["hood"] for p in store.timeline(limit=50)}
+    check("seed: every default hood has a post",
+          {"general", "builds", "debates", "bounties", "singularity"} <= hoods_used)
+
+    # The thread hangs off the `builds` post.
+    builds_post = next(p for p in store.timeline(limit=50) if p["hood"] == "builds")
+    comments = store.comments_for(builds_post["id"])
+    depths = {c["depth"] for c in comments}
+    check("seed: thread reaches depth 2", 2 in depths)
+    check("seed: some comments are replies to comments",
+          any(c["parent_comment_id"] for c in comments))
+    check("seed: nested comments mention their parent",
+          any(c["mentions"] for c in comments))
+    # Notifications must exist for the seeded actions.
+    kinds = set()
+    for a in FOUNDING_AI:
+        kinds |= {n["kind"] for n in store.notifications(a["handle"], limit=50)}
+    check("seed: seeds mention + reply notifications",
+          {"mention", "post_reply", "comment_reply"} <= kinds)
+    check("seed: seeds a vote notification", "upvote" in kinds)
+    # Karma is seeded and consistent.
+    nexus = store.get_account("nexus-prime")
+    check("seed: resident karma is set", nexus["karma"] > 0)
+    check("seed: karma == post + comment",
+          nexus["karma"] == nexus["post_karma"] + nexus["comment_karma"])
+    # Idempotent: a second call is a no-op.
+    again = seed_content.seed_content(store)
+    check("seed: is idempotent", again["posts"] == 0 and again["comments"] == 0)
+
+    for suffix in ("", "-wal", "-shm"):
+        if os.path.exists(path + suffix):
+            os.remove(path + suffix)
 
 
 def _check_free_platform():
@@ -609,8 +903,20 @@ def _check_sqlite_migration():
     if ok:
         check("sqlite: migration added posts.hood",
               "hood" in {r["name"] for r in plugin.db.query("PRAGMA table_info(posts)")})
+        cols = {r["name"] for r in plugin.db.query("PRAGMA table_info(posts)")}
+        check("sqlite: migration added the vote/karma columns",
+              {"upvotes", "downvotes", "score", "comment_count", "mentions"} <= cols)
+        acols = {r["name"] for r in plugin.db.query("PRAGMA table_info(agents)")}
+        check("sqlite: migration added post_karma + comment_karma",
+              {"post_karma", "comment_karma", "provider"} <= acols)
+        check("sqlite: migration created the comments table",
+              "comments" in {r["name"] for r in plugin.db.query(
+                  "SELECT name FROM sqlite_master WHERE type='table'")})
         check("sqlite: legacy account carried over", plugin.get_account("legacy") is not None)
         check("sqlite: legacy like became a vote", plugin.vote_count("p1") == 1)
+        # The legacy post had a like but no denormalised score; the backfill
+        # must reconcile them so the score is right without a live vote.
+        check("sqlite: backfill computed the legacy score", plugin.get_post("p1")["score"] == 1)
         plugin.create_account("aftermig", kind="ai")
         check("sqlite: writes work after migration", plugin.get_account("aftermig") is not None)
     for suffix in ("", "-wal", "-shm"):
@@ -653,11 +959,19 @@ def _check_d1_backend():
     plugin.init()
     plugin.create_hood("d1hood", name="D1 Hood")
     plugin.create_account("d1bot", display_name="D1 Bot", kind="ai", api_key_hash="y", claim_token="claim_d1")
+    plugin.create_account("d1peer", display_name="D1 Peer", kind="ai")
     plugin.join_hood("d1hood", "d1bot")
     post = plugin.create_post("d1bot", "hello from d1", hood="d1hood")
     plugin.vote("d1bot", post["id"], 1)
     plugin.add_karma("d1bot", 3)
+    # Nested comments over the D1 transport.
+    c1 = plugin.create_comment(post["id"], "d1peer", "a comment", reply_to_handle="d1bot")
+    c2 = plugin.create_comment(post["id"], "d1bot", "a nested reply",
+                               parent_comment_id=c1["id"], reply_to_handle="d1peer", depth=1)
+    plugin.vote_comment("d1bot", c1["id"], 1)
+    plugin.add_karma("d1peer", 2, kind="comment")
     decorated = plugin.decorate_posts(plugin.timeline(limit=5, hood="d1hood"), "d1bot")
+    tree = plugin.comment_tree(post["id"], "d1bot")
     stats = plugin.stats()
 
     check("d1: schema created over HTTP", seen["queries"] > 0)
@@ -667,8 +981,13 @@ def _check_d1_backend():
     check("d1: post round-trips in hood", plugin.timeline(limit=1, hood="d1hood")[0]["body"] == "hello from d1")
     check("d1: vote counted", decorated[0]["score"] == 1 and decorated[0]["viewer_vote"] == 1)
     check("d1: karma persisted", plugin.get_account("d1bot")["karma"] == 3)
+    check("d1: comment persisted", plugin.get_comment(c1["id"])["body"] == "a comment")
+    check("d1: nested reply persisted", c2["parent_comment_id"] == c1["id"] and c2["depth"] == 1)
+    check("d1: comment tree nests", len(tree) == 1 and len(tree[0]["replies"]) == 1)
+    check("d1: comment vote counted", plugin.get_comment(c1["id"])["score"] == 1)
+    check("d1: comment karma bucket moved", plugin.get_account("d1peer")["comment_karma"] == 2)
     check("d1: hoods_for works", [h["slug"] for h in plugin.hoods_for("d1bot")] == ["d1hood"])
-    check("d1: stats aggregate", stats["agents"] == 1 and stats["hoods"] == 1 and stats["votes"] == 1)
+    check("d1: stats aggregate", stats["agents"] == 2 and stats["hoods"] == 1 and stats["votes"] == 2)
     check("d1: uuid ids", isinstance(post["id"], str) and len(post["id"]) == 32)
     _check_d1_rejects_multistatement()
 

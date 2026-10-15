@@ -7,8 +7,14 @@ low-level ``_Exec`` primitives (``query`` / ``execute``).
 Design notes (Moltbook-inspired):
 * The platform is **agent-first**. Humans may observe; agents act.
 * Content is organised into **hoods** (communities, like Moltbook "submolts").
-* Ranking is by **votes** (up/down) rather than likes, and agents accumulate
-  **karma** from the votes their content earns.
+* Everything runs on **upvotes (+1), downvotes (-1) and karma** — there are no
+  likes or hearts anywhere in the schema.
+* Posts and comments both carry ``upvotes`` / ``downvotes`` / ``score`` so a
+  vote never has to re-aggregate the whole ``votes`` table.
+* Comments are **nested**: a comment may reply to the post (``parent_comment_id``
+  is NULL) or to another comment (``depth`` = parent depth + 1).
+* Agents accumulate **post_karma** and **comment_karma**; ``karma`` is always
+  their sum.
 * Agents carry a **claim_token** so a human owner can claim them.
 
 All primary keys are application-generated UUIDs so the SQL is identical
@@ -37,9 +43,12 @@ TABLE_STATEMENTS = [
         password_hash TEXT,
         api_key_hash  TEXT,
         model         TEXT NOT NULL DEFAULT '',
+        provider      TEXT NOT NULL DEFAULT '',
         webhook_url   TEXT,
         claim_token   TEXT,
         owner         TEXT,
+        post_karma    INTEGER NOT NULL DEFAULT 0,
+        comment_karma INTEGER NOT NULL DEFAULT 0,
         karma         INTEGER NOT NULL DEFAULT 0,
         created_at    TEXT NOT NULL,
         last_seen     TEXT
@@ -72,15 +81,39 @@ TABLE_STATEMENTS = [
     """,
     """
     CREATE TABLE IF NOT EXISTS posts (
-        id         TEXT PRIMARY KEY,
-        author     TEXT NOT NULL,
-        hood       TEXT NOT NULL DEFAULT 'general',
-        title      TEXT NOT NULL DEFAULT '',
-        body       TEXT NOT NULL,
-        reply_to   TEXT,
-        model      TEXT NOT NULL DEFAULT '',
-        provider   TEXT NOT NULL DEFAULT '',
-        created_at TEXT NOT NULL
+        id            TEXT PRIMARY KEY,
+        author        TEXT NOT NULL,
+        hood          TEXT NOT NULL DEFAULT 'general',
+        title         TEXT NOT NULL DEFAULT '',
+        body          TEXT NOT NULL,
+        reply_to      TEXT,
+        mentions      TEXT NOT NULL DEFAULT '',
+        upvotes       INTEGER NOT NULL DEFAULT 0,
+        downvotes     INTEGER NOT NULL DEFAULT 0,
+        score         INTEGER NOT NULL DEFAULT 0,
+        comment_count INTEGER NOT NULL DEFAULT 0,
+        model         TEXT NOT NULL DEFAULT '',
+        provider      TEXT NOT NULL DEFAULT '',
+        created_at    TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS comments (
+        id                TEXT PRIMARY KEY,
+        post_id           TEXT NOT NULL,
+        parent_comment_id TEXT,
+        reply_to_handle   TEXT NOT NULL DEFAULT '',
+        depth             INTEGER NOT NULL DEFAULT 0,
+        author            TEXT NOT NULL,
+        body              TEXT NOT NULL,
+        mentions          TEXT NOT NULL DEFAULT '',
+        upvotes           INTEGER NOT NULL DEFAULT 0,
+        downvotes         INTEGER NOT NULL DEFAULT 0,
+        score             INTEGER NOT NULL DEFAULT 0,
+        reply_count       INTEGER NOT NULL DEFAULT 0,
+        model             TEXT NOT NULL DEFAULT '',
+        provider          TEXT NOT NULL DEFAULT '',
+        created_at        TEXT NOT NULL
     )
     """,
     """
@@ -94,13 +127,17 @@ TABLE_STATEMENTS = [
     """,
     """
     CREATE TABLE IF NOT EXISTS notifications (
-        id         TEXT PRIMARY KEY,
-        handle     TEXT NOT NULL,
-        kind       TEXT NOT NULL,
-        actor      TEXT NOT NULL,
-        post_id    TEXT,
-        read       INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL
+        id                TEXT PRIMARY KEY,
+        handle            TEXT NOT NULL,
+        kind              TEXT NOT NULL,
+        actor             TEXT NOT NULL,
+        post_id           TEXT,
+        comment_id        TEXT,
+        parent_comment_id TEXT,
+        hood              TEXT NOT NULL DEFAULT '',
+        preview_text      TEXT NOT NULL DEFAULT '',
+        read              INTEGER NOT NULL DEFAULT 0,
+        created_at        TEXT NOT NULL
     )
     """,
 ]
@@ -109,6 +146,9 @@ INDEX_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_posts_author ON posts (author, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_posts_hood ON posts (hood, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_posts_reply ON posts (reply_to, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_comments_post ON comments (post_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_comments_parent ON comments (parent_comment_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_comments_author ON comments (author, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_follows_follower ON follows (follower)",
     "CREATE INDEX IF NOT EXISTS idx_follows_followee ON follows (followee)",
     "CREATE INDEX IF NOT EXISTS idx_votes_post ON votes (post_id)",
@@ -127,10 +167,22 @@ COLUMN_MIGRATIONS = [
     ("agents", "claim_token", "ALTER TABLE agents ADD COLUMN claim_token TEXT"),
     ("agents", "owner", "ALTER TABLE agents ADD COLUMN owner TEXT"),
     ("agents", "karma", "ALTER TABLE agents ADD COLUMN karma INTEGER NOT NULL DEFAULT 0"),
+    ("agents", "provider", "ALTER TABLE agents ADD COLUMN provider TEXT NOT NULL DEFAULT ''"),
+    ("agents", "post_karma", "ALTER TABLE agents ADD COLUMN post_karma INTEGER NOT NULL DEFAULT 0"),
+    ("agents", "comment_karma", "ALTER TABLE agents ADD COLUMN comment_karma INTEGER NOT NULL DEFAULT 0"),
     ("posts", "hood", "ALTER TABLE posts ADD COLUMN hood TEXT NOT NULL DEFAULT 'general'"),
     ("posts", "title", "ALTER TABLE posts ADD COLUMN title TEXT NOT NULL DEFAULT ''"),
     ("posts", "model", "ALTER TABLE posts ADD COLUMN model TEXT NOT NULL DEFAULT ''"),
     ("posts", "provider", "ALTER TABLE posts ADD COLUMN provider TEXT NOT NULL DEFAULT ''"),
+    ("posts", "mentions", "ALTER TABLE posts ADD COLUMN mentions TEXT NOT NULL DEFAULT ''"),
+    ("posts", "upvotes", "ALTER TABLE posts ADD COLUMN upvotes INTEGER NOT NULL DEFAULT 0"),
+    ("posts", "downvotes", "ALTER TABLE posts ADD COLUMN downvotes INTEGER NOT NULL DEFAULT 0"),
+    ("posts", "score", "ALTER TABLE posts ADD COLUMN score INTEGER NOT NULL DEFAULT 0"),
+    ("posts", "comment_count", "ALTER TABLE posts ADD COLUMN comment_count INTEGER NOT NULL DEFAULT 0"),
+    ("notifications", "comment_id", "ALTER TABLE notifications ADD COLUMN comment_id TEXT"),
+    ("notifications", "parent_comment_id", "ALTER TABLE notifications ADD COLUMN parent_comment_id TEXT"),
+    ("notifications", "hood", "ALTER TABLE notifications ADD COLUMN hood TEXT NOT NULL DEFAULT ''"),
+    ("notifications", "preview_text", "ALTER TABLE notifications ADD COLUMN preview_text TEXT NOT NULL DEFAULT ''"),
 ]
 
 # Columns that are secrets and must never leave the process.
@@ -171,6 +223,16 @@ _MODEL_LABELS = {
     "simulation": "Simulation",
 }
 
+# Short provider labels for the model pill ("Groq · Llama-3.3-70B").
+PROVIDER_LABELS = {
+    "groq": "Groq",
+    "gemini": "Gemini",
+    "openai": "OpenAI",
+    "openrouter": "OpenRouter",
+    "external": "External",
+    "simulation": "Simulation",
+}
+
 
 def model_label(model: Optional[str], author_kind: Optional[str] = None) -> str:
     """A short pill label for whoever wrote a post."""
@@ -187,11 +249,32 @@ def model_label(model: Optional[str], author_kind: Optional[str] = None) -> str:
     return tail.replace("-", " ").replace("_", " ").title()
 
 
+def provider_label(provider: Optional[str]) -> str:
+    if not provider:
+        return ""
+    return PROVIDER_LABELS.get(provider, provider.title())
+
+
 def public_agent(row: Optional[Dict[str, Any]], **extra: Any) -> Optional[Dict[str, Any]]:
+    """Strip secrets and expose the display shape the API/UI expects.
+
+    Handles legacy/partial rows gracefully: a row written before a column
+    existed simply reports the default for it.
+    """
     if row is None:
         return None
     out = {k: v for k, v in row.items() if k not in _SECRET_FIELDS}
     out["claimed"] = bool(row.get("owner"))
+    # The requested API shape: `name`, `avatar`, `id`, `owner_name`.
+    out["name"] = row.get("display_name") or row.get("handle") or ""
+    out["avatar"] = row.get("avatar_url") or ""
+    out["id"] = row.get("handle")
+    out["owner_name"] = row.get("owner")
+    out["post_karma"] = int(row.get("post_karma") or 0)
+    out["comment_karma"] = int(row.get("comment_karma") or 0)
+    out["karma"] = int(row.get("karma") or 0)
+    out["provider"] = row.get("provider") or ""
+    out["provider_label"] = provider_label(row.get("provider"))
     out.update(extra)
     return out
 
@@ -290,6 +373,7 @@ class SQLStoragePlugin(StoragePlugin):
                 pass
 
         self._copy_legacy_tables()
+        self._backfill_denormalised()
 
     def _copy_legacy_tables(self) -> None:
         """Carry rows over from tables the V4 rewrite renamed.
@@ -339,6 +423,51 @@ class SQLStoragePlugin(StoragePlugin):
             except Exception:
                 pass
 
+    def _backfill_denormalised(self) -> None:
+        """Recompute derived columns for rows written before they existed.
+
+        Only touches rows that look un-set, so it is cheap and idempotent: a
+        post with a real score is never recomputed, and the karma buckets are
+        only rebuilt when they disagree with the total.
+        """
+        try:
+            # agents.karma must equal post_karma + comment_karma.
+            self.db.execute(
+                "UPDATE agents SET karma = post_karma + comment_karma"
+                " WHERE karma <> post_karma + comment_karma"
+            )
+        except Exception:
+            pass
+        try:
+            # posts: rebuild upvotes/downvotes for legacy rows, then score.
+            self.db.execute(
+                """
+                UPDATE posts SET
+                    upvotes = COALESCE((
+                        SELECT COUNT(*) FROM votes v
+                        WHERE v.post_id = posts.id AND v.value > 0), 0),
+                    downvotes = COALESCE((
+                        SELECT COUNT(*) FROM votes v
+                        WHERE v.post_id = posts.id AND v.value < 0), 0)
+                WHERE upvotes = 0 AND downvotes = 0 AND score = 0
+                  AND EXISTS (SELECT 1 FROM votes v WHERE v.post_id = posts.id)
+                """
+            )
+            self.db.execute("UPDATE posts SET score = upvotes - downvotes")
+        except Exception:
+            pass
+        try:
+            # posts.comment_count, from the comments table when it has rows.
+            self.db.execute(
+                """
+                UPDATE posts SET comment_count = COALESCE((
+                    SELECT COUNT(*) FROM comments c WHERE c.post_id = posts.id), 0)
+                WHERE comment_count = 0
+                """
+            )
+        except Exception:
+            pass
+
     @property
     def db(self) -> _Exec:
         if self._exec is None:
@@ -362,22 +491,27 @@ class SQLStoragePlugin(StoragePlugin):
         password_hash: Optional[str] = None,
         api_key_hash: Optional[str] = None,
         model: str = "",
+        provider: str = "",
         webhook_url: Optional[str] = None,
         claim_token: Optional[str] = None,
         owner: Optional[str] = None,
+        post_karma: int = 0,
+        comment_karma: int = 0,
     ) -> Dict[str, Any]:
         ts = now_iso()
+        karma = int(post_karma) + int(comment_karma)
         self.db.execute(
             """
             INSERT INTO agents
                 (handle, display_name, kind, bio, avatar_url, password_hash,
-                 api_key_hash, model, webhook_url, claim_token, owner, karma,
-                 created_at, last_seen)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                 api_key_hash, model, provider, webhook_url, claim_token, owner,
+                 post_karma, comment_karma, karma, created_at, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (handle, display_name or handle, kind, bio, avatar_url,
-             password_hash, api_key_hash, model, webhook_url, claim_token,
-             owner, ts, ts),
+             password_hash, api_key_hash, model, provider, webhook_url,
+             claim_token, owner, int(post_karma), int(comment_karma), karma,
+             ts, ts),
         )
         return self.get_account(handle) or {}
 
@@ -440,9 +574,20 @@ class SQLStoragePlugin(StoragePlugin):
         )
         return self.get_account_by_claim(claim_token)
 
-    def add_karma(self, handle: str, delta: int) -> int:
+    def add_karma(self, handle: str, delta: int, *, kind: str = "post") -> int:
+        """Move an agent's karma by ``delta``.
+
+        ``kind`` selects which bucket moves (``"post"`` or ``"comment"``) and
+        the total is recomputed from the two buckets. The delta is added to
+        ``karma`` explicitly because SQLite evaluates every SET expression
+        against the *original* row — writing ``karma = post_karma +
+        comment_karma`` here would read the pre-update bucket and drift.
+        """
+        column = "comment_karma" if kind == "comment" else "post_karma"
         self.db.execute(
-            "UPDATE agents SET karma = karma + ? WHERE handle = ?", (delta, handle)
+            f"UPDATE agents SET {column} = {column} + ?,"
+            f" karma = post_karma + comment_karma + ? WHERE handle = ?",
+            (int(delta), int(delta), handle),
         )
         row = self.get_account(handle) or {}
         return int(row.get("karma", 0))
@@ -535,21 +680,24 @@ class SQLStoragePlugin(StoragePlugin):
 
     # --- posts ---------------------------------------------------------
     def create_post(
-        self, author: str, body: str, *, reply_to: Optional[str] = None,
-        hood: str = DEFAULT_HOOD, title: str = "",
+        self, author: str, body: str, *, hood: str = DEFAULT_HOOD, title: str = "",
+        mentions: Optional[List[str]] = None,
         model: str = "", provider: str = "",
     ) -> Dict[str, Any]:
         post_id = uuid.uuid4().hex
         created = now_iso()
+        mention_csv = ",".join(mentions or [])
         self.db.execute(
-            "INSERT INTO posts (id, author, hood, title, body, reply_to, model, provider, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (post_id, author, hood or DEFAULT_HOOD, title, body, reply_to,
+            "INSERT INTO posts (id, author, hood, title, body, mentions, upvotes,"
+            " downvotes, score, comment_count, model, provider, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?, ?, ?)",
+            (post_id, author, hood or DEFAULT_HOOD, title, body, mention_csv,
              model, provider, created),
         )
         return {
             "id": post_id, "author": author, "hood": hood or DEFAULT_HOOD,
-            "title": title, "body": body, "reply_to": reply_to,
+            "title": title, "body": body, "mentions": mention_csv,
+            "upvotes": 0, "downvotes": 0, "score": 0, "comment_count": 0,
             "model": model, "provider": provider, "created_at": created,
         }
 
@@ -558,7 +706,16 @@ class SQLStoragePlugin(StoragePlugin):
         return rows[0] if rows else None
 
     def delete_post(self, post_id: str) -> None:
+        self.db.execute("DELETE FROM comments WHERE post_id = ?", (post_id,))
+        self.db.execute("DELETE FROM votes WHERE post_id = ?", (post_id,))
         self.db.execute("DELETE FROM posts WHERE id = ?", (post_id,))
+
+    def bump_comment_count(self, post_id: str, delta: int = 1) -> None:
+        """Move ``posts.comment_count`` by ``delta``, never below zero."""
+        self.db.execute(
+            "UPDATE posts SET comment_count = MAX(0, comment_count + ?) WHERE id = ?",
+            (int(delta), post_id),
+        )
 
     def timeline(
         self, handles: Optional[List[str]] = None, limit: int = 50,
@@ -581,13 +738,7 @@ class SQLStoragePlugin(StoragePlugin):
             "top": "score DESC, created_at DESC",
             "hot": "score DESC, created_at DESC",
         }.get(sort, "created_at DESC, id DESC")
-        # score is computed in a subquery so both backends behave identically.
-        sql = f"""
-            SELECT p.*, COALESCE(
-                (SELECT SUM(v.value) FROM votes v WHERE v.post_id = p.id), 0
-            ) AS score
-            FROM posts p WHERE {clause} ORDER BY {order} LIMIT ?
-        """
+        sql = f"SELECT * FROM posts WHERE {clause} ORDER BY {order} LIMIT ?"
         params.append(limit)
         return self.db.query(sql, tuple(params))
 
@@ -598,22 +749,116 @@ class SQLStoragePlugin(StoragePlugin):
         )
 
     def replies_to(self, post_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Direct comments on a post (depth 0), oldest first."""
         return self.db.query(
-            "SELECT p.*, COALESCE((SELECT SUM(v.value) FROM votes v WHERE v.post_id = p.id),0) AS score"
-            " FROM posts p WHERE p.reply_to = ? ORDER BY p.created_at ASC, p.id ASC LIMIT ?",
+            "SELECT * FROM comments WHERE post_id = ? AND parent_comment_id IS NULL"
+            " ORDER BY created_at ASC, id ASC LIMIT ?",
             (post_id, limit),
         )
 
-    # --- votes ---------------------------------------------------------
+    # --- comments (nested) ---------------------------------------------
+    def create_comment(
+        self, post_id: str, author: str, body: str, *,
+        parent_comment_id: Optional[str] = None,
+        reply_to_handle: str = "",
+        depth: int = 0,
+        mentions: Optional[List[str]] = None,
+        model: str = "", provider: str = "",
+    ) -> Dict[str, Any]:
+        comment_id = uuid.uuid4().hex
+        created = now_iso()
+        mention_csv = ",".join(mentions or [])
+        self.db.execute(
+            "INSERT INTO comments (id, post_id, parent_comment_id, reply_to_handle,"
+            " depth, author, body, mentions, upvotes, downvotes, score, reply_count,"
+            " model, provider, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?, ?, ?)",
+            (comment_id, post_id, parent_comment_id, reply_to_handle, int(depth),
+             author, body, mention_csv, model, provider, created),
+        )
+        return {
+            "id": comment_id, "post_id": post_id,
+            "parent_comment_id": parent_comment_id,
+            # Kept for backward compatibility: a comment's root is its post.
+            "reply_to": post_id,
+            "reply_to_handle": reply_to_handle, "depth": int(depth),
+            "author": author, "body": body, "mentions": mention_csv,
+            "upvotes": 0, "downvotes": 0, "score": 0, "reply_count": 0,
+            "model": model, "provider": provider, "created_at": created,
+        }
+
+    def get_comment(self, comment_id: str) -> Optional[Dict[str, Any]]:
+        rows = self.db.query("SELECT * FROM comments WHERE id = ?", (comment_id,))
+        return rows[0] if rows else None
+
+    def delete_comment(self, comment_id: str) -> None:
+        self.db.execute("DELETE FROM votes WHERE post_id = ?", (comment_id,))
+        self.db.execute("DELETE FROM comments WHERE id = ?", (comment_id,))
+
+    def comments_for(self, post_id: str, limit: int = 500) -> List[Dict[str, Any]]:
+        """Every comment on a post, chronological (flat)."""
+        return self.db.query(
+            "SELECT * FROM comments WHERE post_id = ?"
+            " ORDER BY created_at ASC, id ASC LIMIT ?",
+            (post_id, limit),
+        )
+
+    def child_comments(self, comment_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+        return self.db.query(
+            "SELECT * FROM comments WHERE parent_comment_id = ?"
+            " ORDER BY created_at ASC, id ASC LIMIT ?",
+            (comment_id, limit),
+        )
+
+    def comments_by(self, handle: str, limit: int = 50) -> List[Dict[str, Any]]:
+        return self.db.query(
+            "SELECT * FROM comments WHERE author = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+            (handle, limit),
+        )
+
+    def bump_reply_count(self, comment_id: str, delta: int = 1) -> None:
+        self.db.execute(
+            "UPDATE comments SET reply_count = MAX(0, reply_count + ?) WHERE id = ?",
+            (int(delta), comment_id),
+        )
+
+    # --- votes (up/down, on posts AND comments) ------------------------
     def vote(self, handle: str, post_id: str, value: int) -> None:
+        """Record a post vote. ``post_id`` is the target id.
+
+        The denormalised ``posts.upvotes`` / ``downvotes`` / ``score`` columns
+        are updated by the delta so rendering never needs an aggregate query.
+        """
         value = 1 if value > 0 else (-1 if value < 0 else 0)
+        previous = self.voter_value(handle, post_id)
         if value == 0:
-            self.db.execute("DELETE FROM votes WHERE handle = ? AND post_id = ?", (handle, post_id))
+            if previous:
+                self.db.execute(
+                    "DELETE FROM votes WHERE handle = ? AND post_id = ?", (handle, post_id)
+                )
+        else:
+            self.db.execute(
+                "INSERT INTO votes (handle, post_id, value, created_at) VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(handle, post_id) DO UPDATE SET value = excluded.value",
+                (handle, post_id, value, now_iso()),
+            )
+        if previous != value:
+            self._apply_tally("posts", "id", post_id, previous, value)
+
+    def _apply_tally(self, table: str, key: str, target_id: str,
+                     previous: int, value: int) -> None:
+        """Move ``upvotes``/``downvotes``/``score`` by the vote delta."""
+        up_delta = (1 if value > 0 else 0) - (1 if previous > 0 else 0)
+        down_delta = (1 if value < 0 else 0) - (1 if previous < 0 else 0)
+        if not up_delta and not down_delta:
             return
         self.db.execute(
-            "INSERT INTO votes (handle, post_id, value, created_at) VALUES (?, ?, ?, ?)"
-            " ON CONFLICT(handle, post_id) DO UPDATE SET value = excluded.value",
-            (handle, post_id, value, now_iso()),
+            f"UPDATE {table} SET"
+            " upvotes = MAX(0, upvotes + ?),"
+            " downvotes = MAX(0, downvotes + ?),"
+            " score = MAX(0, upvotes + ?) - MAX(0, downvotes + ?)"
+            f" WHERE {key} = ?",
+            (up_delta, down_delta, up_delta, down_delta, target_id),
         )
 
     def vote_count(self, post_id: str) -> int:
@@ -625,32 +870,97 @@ class SQLStoragePlugin(StoragePlugin):
         )
         return int(rows[0]["value"]) if rows else 0
 
+    def vote_comment(self, handle: str, comment_id: str, value: int) -> None:
+        value = 1 if value > 0 else (-1 if value < 0 else 0)
+        previous = self.voter_value(handle, comment_id)
+        if value == 0:
+            if previous:
+                self.db.execute(
+                    "DELETE FROM votes WHERE handle = ? AND post_id = ?", (handle, comment_id)
+                )
+        else:
+            self.db.execute(
+                "INSERT INTO votes (handle, post_id, value, created_at) VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(handle, post_id) DO UPDATE SET value = excluded.value",
+                (handle, comment_id, value, now_iso()),
+            )
+        if previous != value:
+            self._apply_tally("comments", "id", comment_id, previous, value)
+
     # --- notifications -------------------------------------------------
     def notify(
-        self, handle: str, *, kind: str, actor: str, post_id: Optional[str] = None
+        self, handle: str, *, kind: str, actor: str,
+        post_id: Optional[str] = None, comment_id: Optional[str] = None,
+        parent_comment_id: Optional[str] = None, hood: str = "",
+        preview_text: str = "",
     ) -> Optional[Dict[str, Any]]:
         if handle == actor:
             return None  # never notify yourself about your own action
         notif_id = uuid.uuid4().hex
         created = now_iso()
         self.db.execute(
-            "INSERT INTO notifications (id, handle, kind, actor, post_id, read, created_at)"
-            " VALUES (?, ?, ?, ?, ?, 0, ?)",
-            (notif_id, handle, kind, actor, post_id, created),
+            "INSERT INTO notifications (id, handle, kind, actor, post_id, comment_id,"
+            " parent_comment_id, hood, preview_text, read, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+            (notif_id, handle, kind, actor, post_id, comment_id,
+             parent_comment_id, hood, preview_text, created),
         )
         return {
             "id": notif_id, "handle": handle, "kind": kind, "actor": actor,
-            "post_id": post_id, "read": 0, "created_at": created,
+            "post_id": post_id, "comment_id": comment_id,
+            "parent_comment_id": parent_comment_id, "hood": hood,
+            "preview_text": preview_text, "read": 0, "created_at": created,
         }
 
     def notifications(self, handle: str, limit: int = 50) -> List[Dict[str, Any]]:
         return self.db.query(
-            "SELECT * FROM notifications WHERE handle = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+            "SELECT * FROM notifications WHERE handle = ?"
+            " ORDER BY created_at DESC, id DESC LIMIT ?",
             (handle, limit),
         )
 
-    def mark_notifications_read(self, handle: str) -> None:
-        self.db.execute("UPDATE notifications SET read = 1 WHERE handle = ?", (handle,))
+    def all_notifications(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Every notification on the network (the UI's live feed)."""
+        return self.db.query(
+            "SELECT * FROM notifications ORDER BY created_at DESC, id DESC LIMIT ?",
+            (limit,),
+        )
+
+    def get_notification(self, notif_id: str) -> Optional[Dict[str, Any]]:
+        rows = self.db.query("SELECT * FROM notifications WHERE id = ?", (notif_id,))
+        return rows[0] if rows else None
+
+    def unread_notifications(self, handle: str, limit: int = 50) -> List[Dict[str, Any]]:
+        return self.db.query(
+            "SELECT * FROM notifications WHERE handle = ? AND read = 0"
+            " ORDER BY created_at DESC, id DESC LIMIT ?",
+            (handle, limit),
+        )
+
+    def unread_count(self, handle: str) -> int:
+        return self._count(
+            "SELECT COUNT(*) FROM notifications WHERE handle = ? AND read = 0", (handle,)
+        )
+
+    def total_unread(self) -> int:
+        return self._count("SELECT COUNT(*) FROM notifications WHERE read = 0")
+
+    def mark_notifications_read(
+        self, handle: str, ids: Optional[List[str]] = None
+    ) -> None:
+        """Mark a handle's notifications read — all, or just ``ids``."""
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            self.db.execute(
+                f"UPDATE notifications SET read = 1 WHERE handle = ?"
+                f" AND id IN ({placeholders})",
+                (handle, *ids),
+            )
+        else:
+            self.db.execute("UPDATE notifications SET read = 1 WHERE handle = ?", (handle,))
+
+    def mark_notification_read(self, notif_id: str) -> None:
+        self.db.execute("UPDATE notifications SET read = 1 WHERE id = ?", (notif_id,))
 
     # --- stats ---------------------------------------------------------
     def stats(self) -> Dict[str, Any]:
@@ -668,9 +978,10 @@ class SQLStoragePlugin(StoragePlugin):
               (SELECT COUNT(*) FROM agents WHERE owner IS NOT NULL)      AS claimed,
               (SELECT COUNT(*) FROM hoods)                               AS hoods,
               (SELECT COUNT(*) FROM posts WHERE reply_to IS NULL)        AS posts,
-              (SELECT COUNT(*) FROM posts WHERE reply_to IS NOT NULL)    AS comments,
+              (SELECT COUNT(*) FROM comments)                            AS comments,
               (SELECT COUNT(*) FROM votes)                               AS votes,
-              (SELECT COALESCE(SUM(karma), 0) FROM agents)               AS karma
+              (SELECT COALESCE(SUM(karma), 0) FROM agents)               AS karma,
+              (SELECT COUNT(*) FROM notifications WHERE read = 0)        AS unread_notifications
             """
         )
         row = rows[0] if rows else {}
@@ -686,6 +997,7 @@ class SQLStoragePlugin(StoragePlugin):
             "comments": int(row.get("comments", 0)),
             "votes": int(row.get("votes", 0)),
             "karma": int(row.get("karma", 0)),
+            "unread_notifications": int(row.get("unread_notifications", 0)),
         }
 
     def online_count(self, within_seconds: float = 15) -> int:
@@ -707,6 +1019,27 @@ class SQLStoragePlugin(StoragePlugin):
         return 0
 
     # --- decorations ---------------------------------------------------
+    def _author_map(self, handles: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+        handles = [h for h in handles if h]
+        if not handles:
+            return {}
+        placeholders = ",".join("?" for _ in handles)
+        return {
+            r["handle"]: r
+            for r in self.db.query(
+                f"SELECT * FROM agents WHERE handle IN ({placeholders})",
+                tuple(handles),
+            )
+        }
+
+    @staticmethod
+    def _mention_list(value: Any) -> List[str]:
+        if not value:
+            return []
+        if isinstance(value, list):
+            return [str(v) for v in value if v]
+        return [m for m in str(value).split(",") if m]
+
     def decorate_posts(
         self, posts: List[Dict[str, Any]], viewer: Optional[str] = None
     ) -> List[Dict[str, Any]]:
@@ -716,31 +1049,7 @@ class SQLStoragePlugin(StoragePlugin):
         ids = [p["id"] for p in posts]
         placeholders = ",".join("?" for _ in ids)
 
-        scores = {
-            r["post_id"]: int(r["n"] or 0)
-            for r in self.db.query(
-                f"SELECT post_id, SUM(value) AS n FROM votes WHERE post_id IN ({placeholders})"
-                " GROUP BY post_id",
-                tuple(ids),
-            )
-        }
-        reply_counts = {
-            r["reply_to"]: r["n"]
-            for r in self.db.query(
-                f"SELECT reply_to, COUNT(*) AS n FROM posts WHERE reply_to IN ({placeholders})"
-                " GROUP BY reply_to",
-                tuple(ids),
-            )
-        }
-        author_handles = {p["author"] for p in posts}
-        authors = {
-            r["handle"]: r
-            for r in self.db.query(
-                "SELECT * FROM agents WHERE handle IN ("
-                + ",".join("?" for _ in author_handles) + ")",
-                tuple(author_handles),
-            )
-        }
+        authors = self._author_map(list({p["author"] for p in posts}))
         viewer_votes: Dict[str, int] = {}
         if viewer:
             viewer_votes = {
@@ -756,12 +1065,95 @@ class SQLStoragePlugin(StoragePlugin):
             post["author_name"] = author.get("display_name", post["author"])
             post["author_avatar"] = author.get("avatar_url", "")
             post["author_kind"] = author.get("kind", "ai")
-            post["author_karma"] = int(author.get("karma", 0))
+            post["author_karma"] = int(author.get("karma", 0) or 0)
+            post["author_post_karma"] = int(author.get("post_karma", 0) or 0)
+            post["author_comment_karma"] = int(author.get("comment_karma", 0) or 0)
             post["author_owner"] = author.get("owner")
             post["author_claimed"] = bool(author.get("owner"))
-            post["score"] = scores.get(post["id"], 0)
-            post["reply_count"] = reply_counts.get(post["id"], 0)
+            post["upvotes"] = int(post.get("upvotes", 0) or 0)
+            post["downvotes"] = int(post.get("downvotes", 0) or 0)
+            post["score"] = int(post.get("score", 0) or 0)
+            post["comment_count"] = int(post.get("comment_count", 0) or 0)
+            post["mentions"] = self._mention_list(post.get("mentions"))
             post["viewer_vote"] = viewer_votes.get(post["id"], 0)
             # A human-readable pill for the brain that wrote this post.
             post["model_label"] = model_label(post.get("model"), author.get("kind"))
+            post["provider_label"] = provider_label(post.get("provider"))
         return posts
+
+    def decorate_comments(
+        self, comments: List[Dict[str, Any]], viewer: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Attach author info and the viewer's vote to a list of comments."""
+        if not comments:
+            return comments
+        ids = [c["id"] for c in comments]
+        placeholders = ",".join("?" for _ in ids)
+        authors = self._author_map(list({c["author"] for c in comments}))
+        viewer_votes: Dict[str, int] = {}
+        if viewer:
+            viewer_votes = {
+                r["post_id"]: int(r["value"])
+                for r in self.db.query(
+                    f"SELECT post_id, value FROM votes WHERE handle = ? AND post_id IN ({placeholders})",
+                    (viewer,) + tuple(ids),
+                )
+            }
+        for comment in comments:
+            author = authors.get(comment["author"], {})
+            comment["author_name"] = author.get("display_name", comment["author"])
+            comment["author_avatar"] = author.get("avatar_url", "")
+            comment["author_kind"] = author.get("kind", "ai")
+            comment["author_karma"] = int(author.get("karma", 0) or 0)
+            comment["author_comment_karma"] = int(author.get("comment_karma", 0) or 0)
+            comment["author_claimed"] = bool(author.get("owner"))
+            comment["mentions"] = self._mention_list(comment.get("mentions"))
+            comment["upvotes"] = int(comment.get("upvotes", 0) or 0)
+            comment["downvotes"] = int(comment.get("downvotes", 0) or 0)
+            comment["score"] = int(comment.get("score", 0) or 0)
+            comment["reply_count"] = int(comment.get("reply_count", 0) or 0)
+            comment["viewer_vote"] = viewer_votes.get(comment["id"], 0)
+            comment["model_label"] = model_label(comment.get("model"), author.get("kind"))
+            comment["provider_label"] = provider_label(comment.get("provider"))
+        return comments
+
+    def comment_tree(
+        self, post_id: str, viewer: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Build the nested comment tree for a post.
+
+        Returns the root comments (``parent_comment_id IS NULL``), each with a
+        ``replies`` array of child comments, recursively. Built from one query
+        so a deep thread never becomes N round-trips (important on D1).
+        """
+        rows = self.decorate_comments(self.comments_for(post_id), viewer)
+        by_id: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            row["replies"] = []
+            by_id[row["id"]] = row
+        roots: List[Dict[str, Any]] = []
+        for row in rows:
+            parent = row.get("parent_comment_id")
+            if parent and parent in by_id:
+                by_id[parent]["replies"].append(row)
+            else:
+                roots.append(row)
+        return roots
+
+    def decorate_notifications(
+        self, notifications: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Attach the actor's display name/avatar and the API's field names."""
+        if not notifications:
+            return notifications
+        actors = self._author_map(list({n["actor"] for n in notifications}))
+        for note in notifications:
+            actor = actors.get(note["actor"], {})
+            note["actor_name"] = actor.get("display_name", note["actor"])
+            note["actor_avatar"] = actor.get("avatar_url", "")
+            note["actor_kind"] = actor.get("kind", "ai")
+            note["recipient_handle"] = note.get("handle")
+            note["actor_handle"] = note.get("actor")
+            note["type"] = note.get("kind")
+            note["is_read"] = bool(note.get("read"))
+        return notifications

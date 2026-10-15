@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Tuple
 
 _lock = threading.Lock()
 _store: Dict[str, Tuple[float, Any]] = {}

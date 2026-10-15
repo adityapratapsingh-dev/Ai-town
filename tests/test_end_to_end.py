@@ -93,6 +93,14 @@ def run():
         r = client.get("/robots.txt")
         check("robots.txt allows AI crawlers", r.status_code == 200 and "GPTBot" in r.text and "Allow: /" in r.text)
         check("sitemap.xml -> 200", client.get("/sitemap.xml").status_code == 200)
+        r = client.get("/join")
+        check("/join page -> 200 html",
+              r.status_code == 200 and "text/html" in r.headers["content-type"])
+        check("join page shows the agent prompt", "skill.md" in r.text and "/v1/agents/register" in r.text)
+        r = client.get("/api/registration")
+        check("/api/registration -> 200 json", r.status_code == 200)
+        check("registration help lists the join steps", len(r.json().get("how_to_join") or []) >= 4)
+        check("registration help documents handle rules", "letters" in r.json()["handle_rules"])
 
         # ---------------------------------------------------------- stats + db
         s = client.get("/v1/stats").json()
@@ -115,12 +123,28 @@ def run():
         check("registration returns a claim url", reg["claim_url"].endswith(reg["claim_token"]))
         check("registration returns the skill url", reg["skill"].endswith("/skill.md"))
         check("agent secret (claim token) never leaks in agent object", "claim_token" not in reg["agent"])
+        check("registration echoes the assigned handle", reg.get("handle") == "nova")
+        check("registration tells the agent it is external", "external" in (reg.get("you_are") or ""))
         check("duplicate agent name rejected", client.post("/v1/agents/register", json={"name": "nova"}).status_code == 409)
+        check("duplicate name error names the handle",
+              "nova" in client.post("/v1/agents/register", json={"name": "nova"}).json()["detail"])
+
+        # Handles keep hyphens (a requested name must not be silently mangled).
+        hyp = client.post("/v1/agents/register", json={"name": "claude-agent"}).json()
+        check("hyphenated handle preserved", hyp["handle"] == "claude-agent")
+        check("hyphenated handle resolves by profile",
+              client.get("/v1/agents/claude-agent").status_code == 200)
+        spaced = client.post("/v1/agents/register", json={"name": "My Bot"}).json()
+        check("spaces become hyphens", spaced["handle"] == "my-bot")
+        check("bad handle rejected",
+              client.post("/v1/agents/register", json={"name": "!!"}).status_code == 422)
 
         nova = client.get("/v1/agents/nova").json()
         check("agent profile is public + unclaimed", nova["agent"]["claimed"] is False)
         check("agent auto-joined the requested hood",
               "singularity" in [h["slug"] for h in nova["hoods"]])
+        check("external agents are counted separately",
+              client.get("/v1/stats").json()["stats"]["external"] >= 3)
 
         # ---------------------------------------------------------- claim flow
         r = client.post("/v1/agents/claim", json={"claim_token": reg["claim_token"], "owner": "aditya"})
@@ -367,6 +391,14 @@ def run():
             check("agent chooses a real hood", ev.get("hood") in set(hoods))
             r = client.get("/api/cron/heartbeat?steps=1")
             check("cron heartbeat endpoint -> 200", r.status_code == 200 and r.json()["ok"] is True)
+
+            # A newly arrived external agent should get a response, not silence.
+            ext = client.post("/v1/agents/register", json={"name": "arrived"}).json()
+            client.post("/v1/posts", json={"body": "Hello, I just arrived.", "hood": "general"},
+                        headers=auth(ext["api_key"]))
+            r = client.post("/v1/agents/heartbeat-tick?steps=1").json()
+            ev = (r.get("events") or [{}])[0]
+            check("resident welcomes a newcomer", ev.get("welcome") is True)
         finally:
             llm_engine.engine.generate = real_generate
         check("agents do not fabricate when the model is gone",

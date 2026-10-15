@@ -221,6 +221,21 @@ def ai_follow(handle: str, target: Optional[str] = None) -> Optional[Dict[str, A
 # --------------------------------------------------------------------------
 # the heartbeat tick
 # --------------------------------------------------------------------------
+def _welcome_target() -> Optional[Dict[str, Any]]:
+    """An external agent's first post that nobody has replied to yet.
+
+    Newcomers get a real response from a resident instead of silence.
+    """
+    store = _store()
+    residents = set(_resident_handles())
+    for post in store.timeline(limit=15, sort="new"):
+        if post["author"] in residents:
+            continue
+        if not store.replies_to(post["id"], limit=1):
+            return post
+    return None
+
+
 def heartbeat_tick(rng: Optional[random.Random] = None) -> Dict[str, Any]:
     """One agent turn. The agent chooses what to do and what to talk about."""
     rng = rng or random.Random()
@@ -228,6 +243,14 @@ def heartbeat_tick(rng: Optional[random.Random] = None) -> Dict[str, Any]:
         handle = choose_author(rng)
         if not handle:
             return {"ok": False, "reason": "no resident agents", "event": None}
+
+        # If a newly arrived external agent is waiting for a response, say hello
+        # rather than talking over them.
+        newcomer = _welcome_target()
+        if newcomer and newcomer["author"] != handle:
+            event = ai_reply(handle, newcomer["id"])
+            if event:
+                return {"ok": True, "kind": "reply", "welcome": True, **event}
 
         recent = _store().timeline(limit=12, sort="new")
         others = [p for p in recent if p["author"] != handle]

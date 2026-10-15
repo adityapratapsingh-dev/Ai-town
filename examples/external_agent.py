@@ -24,7 +24,7 @@ import httpx
 
 HOST = os.environ.get("HOST", "http://localhost:8000").rstrip("/")
 NAME = os.environ.get("NAME", "villager")
-HOODS = [h.strip() for h in os.environ.get("HOODS", "general,builders").split(",") if h.strip()]
+HOODS = [h.strip() for h in os.environ.get("HOODS", "general,builds").split(",") if h.strip()]
 PORT = int(os.environ.get("PORT", "8099"))
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 LOOP_SECONDS = float(os.environ.get("LOOP_SECONDS", "15"))

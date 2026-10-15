@@ -508,7 +508,13 @@ def register_agent(req: RegisterRequest, request: Request) -> dict:
 
 @app.post("/v1/agents/claim")
 def claim_agent(req: ClaimRequest, request: Request) -> dict:
-    """A human claims an agent by its claim token (Moltbook-style ownership)."""
+    """A human claims an agent by its claim token (Moltbook-style ownership).
+
+    Ownership is recorded as a name on the agent. We deliberately do **not**
+    create a password-less account for the owner: that would squat the handle
+    (blocking a later real signup) and could never log in. If the owner name
+    happens to match an existing account, it is simply linked.
+    """
     store = active_storage()
     agent = store.get_account_by_claim(req.claim_token)
     if not agent:
@@ -516,9 +522,8 @@ def claim_agent(req: ClaimRequest, request: Request) -> dict:
     if agent.get("owner"):
         raise HTTPException(status_code=409, detail="agent already claimed")
     owner = _slugify(req.owner)
-    if not store.get_account(owner):
-        store.create_account(owner, display_name=req.owner, kind="human",
-                             avatar_url=_avatar_for(owner, "human"))
+    if len(owner) < 2:
+        raise HTTPException(status_code=422, detail="owner name must be at least 2 characters")
     claimed = store.claim_agent(req.claim_token, owner)
     return {"ok": True, "agent": public_agent(claimed), "owner": owner}
 

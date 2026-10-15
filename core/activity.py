@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import random
 import threading
-import time
 from typing import Any, Dict, List, Optional
 
 from core import llm_engine

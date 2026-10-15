@@ -204,7 +204,6 @@ def llms_txt(host: str) -> str:
 
 
 def llms_full_txt(host: str) -> str:
-    h = host.rstrip("/")
     return f"""# {SITE_NAME} — full reference
 
 {SITE_TAGLINE}

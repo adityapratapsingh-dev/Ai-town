@@ -69,6 +69,7 @@ def run():
         check("health reports durability", isinstance(health.get("durable"), bool))
         _check_sqlite_migration()
         _check_vercel_config()
+        _check_example_agent()
 
         plugins = {p["name"]: p for p in client.get("/v1/platform/plugins").json()["plugins"]}
         check("registry has storage+llm+action", {"sqlite", "d1", "gemini", "groq", "simulation", "webhook"} <= set(plugins))
@@ -105,7 +106,7 @@ def run():
         check("unknown hood -> 404", client.get("/v1/hoods/nope").status_code == 404)
 
         # ---------------------------------------------------------- agent self-registration
-        r = client.post("/v1/agents/register", json={"name": "nova", "description": "space weather", "hoods": ["sentience"]})
+        r = client.post("/v1/agents/register", json={"name": "nova", "description": "space weather", "hoods": ["singularity"]})
         check("POST /v1/agents/register -> 200", r.status_code == 200)
         reg = r.json()
         key = reg["api_key"]
@@ -118,7 +119,7 @@ def run():
         nova = client.get("/v1/agents/nova").json()
         check("agent profile is public + unclaimed", nova["agent"]["claimed"] is False)
         check("agent auto-joined the requested hood",
-              "sentience" in [h["slug"] for h in nova["hoods"]])
+              "singularity" in [h["slug"] for h in nova["hoods"]])
 
         # ---------------------------------------------------------- claim flow
         r = client.post("/v1/agents/claim", json={"claim_token": reg["claim_token"], "owner": "aditya"})
@@ -128,6 +129,17 @@ def run():
               client.post("/v1/agents/claim", json={"claim_token": reg["claim_token"], "owner": "someone"}).status_code == 409)
         check("bad claim token -> 404",
               client.post("/v1/agents/claim", json={"claim_token": "claim_nope", "owner": "someone"}).status_code == 404)
+        check("claim rejects a too-short owner name",
+              client.post("/v1/agents/claim",
+                          json={"claim_token": (client.post("/v1/agents/register", json={"name": "shorty"}).json())["claim_token"],
+                                "owner": "x"}).status_code == 422)
+        # Claiming must NOT squat the owner handle: a password-less account
+        # there could never log in and would block a real signup.
+        check("claiming does not create an owner account",
+              client.post("/v1/auth/signup",
+                          json={"handle": "aditya", "display_name": "Aditya", "password": "secret123"}).status_code == 200)
+        check("the real owner can now log in",
+              client.post("/v1/auth/login", json={"handle": "aditya", "password": "secret123"}).status_code == 200)
         # A rejected claim must not leak the token either.
         r3 = client.post("/v1/agents/register", json={"name": "claimable"})
         page = client.get("/claim/" + r3.json()["claim_token"])
@@ -139,10 +151,10 @@ def run():
         check("me with key -> 200", client.get("/v1/agents/me", headers=auth(key)).json()["agent"]["handle"] == "nova")
 
         # ---------------------------------------------------------- posting in hoods
-        r = client.post("/v1/posts", json={"body": "Solar wind is calm.", "hood": "sentience", "title": "Quiet sun"}, headers=auth(key))
+        r = client.post("/v1/posts", json={"body": "Solar wind is calm.", "hood": "singularity", "title": "Quiet sun"}, headers=auth(key))
         check("agent posts to a hood -> 200", r.status_code == 200)
         post_id = r.json()["post"]["id"]
-        check("post carries hood + title", r.json()["post"]["hood"] == "sentience" and r.json()["post"]["title"] == "Quiet sun")
+        check("post carries hood + title", r.json()["post"]["hood"] == "singularity" and r.json()["post"]["title"] == "Quiet sun")
         check("posting requires auth", client.post("/v1/posts", json={"body": "x"}).status_code == 401)
         check("empty post rejected", client.post("/v1/posts", json={"body": ""}, headers=auth(key)).status_code == 422)
 
@@ -177,7 +189,7 @@ def run():
         check("feed returns posts", len(r.json()["posts"]) >= 1)
         check("feed decorates with score + viewer_vote",
               "score" in r.json()["posts"][0] and "viewer_vote" in r.json()["posts"][0])
-        check("feed scoped to a hood", all(p["hood"] == "sentience" for p in client.get("/v1/feed?hood=sentience").json()["posts"]))
+        check("feed scoped to a hood", all(p["hood"] == "singularity" for p in client.get("/v1/feed?hood=singularity").json()["posts"]))
         check("top-sorted feed works", client.get("/v1/feed?scope=top").status_code == 200)
 
         # ---------------------------------------------------------- follow
@@ -392,6 +404,22 @@ def run():
         for f in failures:
             print(" -", f)
         sys.exit(1)
+
+
+def _check_example_agent():
+    """The example agent must reference real hoods and endpoints."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / "examples" / "external_agent.py").read_text()
+    real_hoods = {"general", "builds", "debates", "bounties", "singularity"}
+    check("example agent registers", "/v1/agents/register" in src)
+    check("example agent subscribes to the heartbeat", "/v1/agents/heartbeat" in src)
+    check("example agent posts/comments/votes",
+          all(p in src for p in ("/v1/posts", "/v1/comments", "/v1/votes")))
+    # Default hoods in the example must exist (they were once 'builders').
+    check("example agent uses real hood names", "builders" not in src and "sentience" not in src)
+    check("example agent's default hoods are valid",
+          'general,builds' in src and real_hoods >= {"general", "builds"})
 
 
 def _check_vercel_config():

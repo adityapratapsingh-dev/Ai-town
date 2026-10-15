@@ -26,7 +26,7 @@ from plugins.base import StoragePlugin
 
 DEFAULT_HOOD = "general"
 
-SCHEMA_STATEMENTS = [
+TABLE_STATEMENTS = [
     """
     CREATE TABLE IF NOT EXISTS agents (
         handle        TEXT PRIMARY KEY,
@@ -101,6 +101,9 @@ SCHEMA_STATEMENTS = [
         created_at TEXT NOT NULL
     )
     """,
+]
+
+INDEX_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_posts_author ON posts (author, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_posts_hood ON posts (hood, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_posts_reply ON posts (reply_to, created_at)",
@@ -111,8 +114,37 @@ SCHEMA_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_notif_handle ON notifications (handle, created_at)",
 ]
 
+# --- migrations -----------------------------------------------------------
+# Columns added after a table first shipped. A database created by an earlier
+# version of the app still has the OLD table (CREATE TABLE IF NOT EXISTS leaves
+# it alone), so an index over a new column fails with "no such column" — which
+# D1 reports as HTTP 400 and which used to abort the whole schema, dropping the
+# app onto ephemeral SQLite. We add missing columns before building indexes.
+#   (table, column, "ALTER TABLE ... ADD COLUMN ...")
+COLUMN_MIGRATIONS = [
+    ("agents", "claim_token", "ALTER TABLE agents ADD COLUMN claim_token TEXT"),
+    ("agents", "owner", "ALTER TABLE agents ADD COLUMN owner TEXT"),
+    ("agents", "karma", "ALTER TABLE agents ADD COLUMN karma INTEGER NOT NULL DEFAULT 0"),
+    ("posts", "hood", "ALTER TABLE posts ADD COLUMN hood TEXT NOT NULL DEFAULT 'general'"),
+    ("posts", "title", "ALTER TABLE posts ADD COLUMN title TEXT NOT NULL DEFAULT ''"),
+]
+
 # Columns that are secrets and must never leave the process.
 _SECRET_FIELDS = ("password_hash", "api_key_hash", "claim_token")
+
+
+# --- data migrations ------------------------------------------------------
+# The V4 rewrite renamed the `accounts` table to `agents` and the `likes` table
+# to `votes`. A database created by the earlier version still holds the old
+# rows; copy them across so nobody loses their account, posts or votes.
+def _table_exists(exec_, table: str) -> bool:
+    try:
+        rows = exec_.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        )
+    except Exception:
+        return False
+    return bool(rows)
 
 
 def now_iso() -> str:
@@ -181,7 +213,95 @@ class SQLStoragePlugin(StoragePlugin):
     def init(self) -> None:
         if self._exec is None:
             self._exec = _CacheInvalidatingExec(self._connect())
-        self._exec.executescript(SCHEMA_STATEMENTS)
+        # Order matters: create tables, bring old tables up to date, THEN build
+        # indexes (which may reference columns added by a migration).
+        self._exec.executescript(TABLE_STATEMENTS)
+        self._migrate()
+        # Indexes are an optimisation: if one cannot be built (e.g. a column
+        # missing on some legacy table) it must not stop the app from serving.
+        for stmt in INDEX_STATEMENTS:
+            try:
+                self._exec.execute(stmt)
+            except Exception:
+                pass
+
+    def _table_columns(self, table: str) -> set:
+        """Column names of ``table`` (empty set if the table doesn't exist)."""
+        try:
+            rows = self.db.query(f"PRAGMA table_info({table})")
+        except Exception:
+            return set()
+        return {r.get("name") for r in rows}
+
+    def _migrate(self) -> None:
+        """Bring an older database up to the current schema, in place.
+
+        Runs before indexes so an index over a newly-added column can succeed.
+        Each migration is independent and best-effort: a database that is
+        already current, or one that is missing a table entirely, must not
+        prevent the app from starting.
+        """
+        for table, column, ddl in COLUMN_MIGRATIONS:
+            cols = self._table_columns(table)
+            if not cols:
+                continue  # table doesn't exist yet; CREATE TABLE handles it
+            if column in cols:
+                continue
+            try:
+                self.db.execute(ddl)
+            except Exception:
+                # e.g. a duplicate-column race between instances: harmless.
+                pass
+
+        self._copy_legacy_tables()
+
+    def _copy_legacy_tables(self) -> None:
+        """Carry rows over from tables the V4 rewrite renamed.
+
+        `accounts` -> `agents`, `likes` -> `votes`. Copy-only (the old table is
+        left in place) and idempotent, so it is safe to run on every start.
+        """
+        if _table_exists(self.db, "accounts"):
+            try:
+                # COALESCE everywhere: the old schema allowed NULLs that the new
+                # NOT NULL columns reject, which would abort the whole copy.
+                self.db.execute(
+                    """
+                    INSERT INTO agents
+                        (handle, display_name, kind, bio, avatar_url, password_hash,
+                         api_key_hash, model, webhook_url, created_at, last_seen)
+                    SELECT handle,
+                           COALESCE(display_name, handle, ''),
+                           COALESCE(kind, 'ai'),
+                           COALESCE(bio, ''),
+                           COALESCE(avatar_url, ''),
+                           password_hash,
+                           api_key_hash,
+                           COALESCE(model, ''),
+                           webhook_url,
+                           COALESCE(created_at, ''),
+                           last_seen
+                    FROM accounts
+                    WHERE handle IS NOT NULL
+                      AND handle NOT IN (SELECT handle FROM agents)
+                    """
+                )
+            except Exception:
+                pass
+        if _table_exists(self.db, "likes"):
+            try:
+                self.db.execute(
+                    """
+                    INSERT INTO votes (handle, post_id, value, created_at)
+                    SELECT handle, post_id, 1, created_at FROM likes
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM votes v
+                        WHERE v.handle = likes.handle AND v.post_id = likes.post_id
+                    )
+                    """
+                )
+            except Exception:
+                pass
 
     @property
     def db(self) -> _Exec:

@@ -62,6 +62,8 @@ def run():
         check("seeded 3 founding agents", health["stats"]["ai"] == 3)
         check("seeded hoods", health["stats"]["hoods"] >= 3)
         check("no dummy posts seeded", health["stats"]["posts"] == 0)
+        check("health reports durability", isinstance(health.get("durable"), bool))
+        _check_sqlite_migration()
 
         plugins = {p["name"]: p for p in client.get("/v1/platform/plugins").json()["plugins"]}
         check("registry has storage+llm+action", {"sqlite", "d1", "gemini", "groq", "simulation", "webhook"} <= set(plugins))
@@ -327,6 +329,52 @@ def run():
         sys.exit(1)
 
 
+def _check_sqlite_migration():
+    """An old-schema SQLite file must migrate in place, keeping its data."""
+    import sqlite3
+
+    from plugins.storage.sqlite import SQLiteStoragePlugin
+
+    path = "/tmp/aivilli_legacy.db"
+    for suffix in ("", "-wal", "-shm"):
+        if os.path.exists(path + suffix):
+            os.remove(path + suffix)
+    legacy = sqlite3.connect(path)
+    legacy.executescript(
+        """
+        CREATE TABLE accounts (handle TEXT PRIMARY KEY, display_name TEXT, kind TEXT, bio TEXT,
+          avatar_url TEXT, password_hash TEXT, api_key_hash TEXT, model TEXT, webhook_url TEXT,
+          created_at TEXT, last_seen TEXT);
+        CREATE TABLE posts (id TEXT PRIMARY KEY, author TEXT NOT NULL, body TEXT NOT NULL,
+          reply_to TEXT, created_at TEXT NOT NULL);
+        CREATE TABLE likes (handle TEXT, post_id TEXT, created_at TEXT, PRIMARY KEY (handle, post_id));
+        INSERT INTO accounts (handle, kind, created_at) VALUES ('legacy','ai','2026-01-01');
+        INSERT INTO posts (id, author, body, created_at) VALUES ('p1','legacy','old','2026-01-01');
+        INSERT INTO likes (handle, post_id, created_at) VALUES ('legacy','p1','2026-01-01');
+        """
+    )
+    legacy.commit()
+    legacy.close()
+
+    plugin = SQLiteStoragePlugin(path)
+    ok = True
+    try:
+        plugin.init()
+    except Exception:
+        ok = False
+    check("sqlite: legacy database migrates in place", ok)
+    if ok:
+        check("sqlite: migration added posts.hood",
+              "hood" in {r["name"] for r in plugin.db.query("PRAGMA table_info(posts)")})
+        check("sqlite: legacy account carried over", plugin.get_account("legacy") is not None)
+        check("sqlite: legacy like became a vote", plugin.vote_count("p1") == 1)
+        plugin.create_account("aftermig", kind="ai")
+        check("sqlite: writes work after migration", plugin.get_account("aftermig") is not None)
+    for suffix in ("", "-wal", "-shm"):
+        if os.path.exists(path + suffix):
+            os.remove(path + suffix)
+
+
 def _check_d1_backend():
     """Drive the real D1 SQL through a stubbed HTTP transport (no creds needed)."""
     import json as _json
@@ -430,6 +478,73 @@ def _check_d1_rejects_multistatement():
         plugin.create_account("persisted", kind="ai")
         check("d1: writes land after per-statement schema",
               plugin.get_account("persisted") is not None)
+    _check_d1_legacy_database()
+
+
+def _check_d1_legacy_database():
+    """A D1 database created by the EARLIER app must migrate in place.
+
+    This is the production outage: the old `posts` table has no `hood` column,
+    so `CREATE INDEX ... ON posts (hood, ...)` fails with "no such column" ->
+    HTTP 400 -> init() raised -> the app fell back to ephemeral SQLite and
+    registrations vanished. The fix adds missing columns before building
+    indexes.
+    """
+    import json as _json
+    import sqlite3
+
+    import httpx
+
+    from plugins.storage.d1 import D1StoragePlugin
+
+    mem = sqlite3.connect(":memory:")
+    mem.row_factory = sqlite3.Row
+    mem.executescript(
+        """
+        CREATE TABLE accounts (handle TEXT PRIMARY KEY, display_name TEXT, kind TEXT, bio TEXT,
+          avatar_url TEXT, password_hash TEXT, api_key_hash TEXT, model TEXT, webhook_url TEXT,
+          created_at TEXT, last_seen TEXT);
+        CREATE TABLE posts (id TEXT PRIMARY KEY, author TEXT NOT NULL, body TEXT NOT NULL,
+          reply_to TEXT, created_at TEXT NOT NULL);
+        CREATE TABLE likes (handle TEXT, post_id TEXT, created_at TEXT, PRIMARY KEY (handle, post_id));
+        CREATE TABLE follows (follower TEXT, followee TEXT, created_at TEXT, PRIMARY KEY (follower, followee));
+        CREATE TABLE notifications (id TEXT PRIMARY KEY, handle TEXT, kind TEXT, actor TEXT, post_id TEXT, read INTEGER, created_at TEXT);
+        INSERT INTO accounts (handle, kind, created_at) VALUES ('legacy','ai','2026-01-01');
+        """
+    )
+    mem.commit()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = _json.loads(request.content)
+        sql = payload["sql"]
+        params = tuple(payload.get("params", []))
+        if params == () and ";" in sql.strip().rstrip(";"):
+            return httpx.Response(400, json={"success": False, "errors": [
+                {"code": 7500, "message": "A prepared SQL statement must contain only one statement."}], "result": []})
+        try:
+            cur = mem.execute(sql, params)
+            rows = [dict(r) for r in cur.fetchall()] if cur.description else []
+            mem.commit()
+        except sqlite3.OperationalError as exc:
+            return httpx.Response(400, json={"success": False, "errors": [
+                {"code": 7500, "message": str(exc)}], "result": []})
+        return httpx.Response(200, json={"success": True, "errors": [],
+                                         "result": [{"success": True, "results": rows, "meta": {}}]})
+
+    plugin = D1StoragePlugin("acct", "dbid", "tok", transport=httpx.MockTransport(handler))
+    ok = True
+    try:
+        plugin.init()
+    except Exception:
+        ok = False
+    check("d1: legacy database initialises (no 'no such column')", ok)
+    if ok:
+        cols = {r["name"] for r in mem.execute("PRAGMA table_info(posts)")}
+        check("d1: migration added posts.hood", "hood" in cols)
+        check("d1: migration added posts.title", "title" in cols)
+        plugin.create_account("fresh", kind="ai")
+        check("d1: new registration persists after migration", plugin.get_account("fresh") is not None)
+        check("d1: legacy account carried over", plugin.get_account("legacy") is not None)
 
 
 def _check_storage_fallback():

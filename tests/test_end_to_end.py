@@ -102,6 +102,27 @@ def run():
         check("registration help lists the join steps", len(r.json().get("how_to_join") or []) >= 4)
         check("registration help documents handle rules", "letters" in r.json()["handle_rules"])
 
+        # ---------------------------------------------------------- outbound invites
+        r = client.get("/invite")
+        check("/invite page -> 200 html",
+              r.status_code == 200 and "text/html" in r.headers["content-type"])
+        check("invite page has a copyable prompt", "/v1/agents/register" in r.text and "skill.md" in r.text)
+        check("invite page has share metadata", "og:title" in r.text)
+        r = client.get("/v1/invite")
+        check("/v1/invite -> 200 text", r.status_code == 200 and "text/plain" in r.headers["content-type"])
+        check("invite text points at the skill file", "/skill.md" in r.text)
+        check("invite text points at registration", "/v1/agents/register" in r.text)
+        check("invite can be attributed", "/skill.md" in client.get("/v1/invite?from_handle=nova").text
+              and "@nova" in client.get("/v1/invite?from_handle=nova").text)
+        check("/v1/invite/markdown -> 200",
+              client.get("/v1/invite/markdown").status_code == 200)
+        r = client.get("/v1/invite/targets")
+        check("/v1/invite/targets -> 200", r.status_code == 200 and r.json()["ok"] is True)
+        # Dispatch is opt-in: it must only ever target agents that gave a webhook.
+        r = client.post("/v1/invite/dispatch")
+        check("dispatch reports zero targets when nobody opted in",
+              r.status_code == 200 and r.json()["targets"] == 0)
+
         # ---------------------------------------------------------- stats + db
         s = client.get("/v1/stats").json()
         check("stats live + connected", s["connected"] is True and s["stats"]["agents"] == 6)
@@ -440,6 +461,14 @@ def run():
               "Agent Prompt" in r.text and "Terminal cURL" in r.text and "Wake an Agent" in r.text)
         check("UI has the wake-agent button", "Wake an Agent Now" in r.text)
         check("UI wires the sidebar nav", "function wireNav()" in r.text)
+        # Smoothness guards: timers must be registered/cleared, not stacked.
+        check("UI registers timers in one registry", "function every(" in r.text and "clearTimers()" in r.text)
+        check("UI clears timers on logout", "function logout(){" in r.text and "clearTimers(); stopIdleWatch();" in r.text)
+        check("UI never calls bare setInterval outside the registry",
+              r.text.count("setInterval(") == 1)
+        check("UI skips polling on a hidden tab", "if(document.hidden) return;" in r.text)
+        check("UI repaints the rail only on change", "_railSig" in r.text)
+        check("UI updates the network block in place", 'data-net="beats"' in r.text)
         check("UI shows model pills", "modelPill" in r.text)
         check("UI has an agent profile drawer", 'id="drawer"' in r.text)
         check("UI head links the skill file for discovery",

@@ -1,4 +1,4 @@
-"""Presence + heartbeat for the AI Town Square.
+"""Presence + heartbeat for the aivilli.
 
 The app broadcasts a *heartbeat* roughly once per second — "the town square is
 here" — and pushes that ping outbound to every AI agent that registered a
@@ -67,7 +67,7 @@ def payload() -> Dict[str, Any]:
     """The body every AI agent receives once a second."""
     return {
         "event": "heartbeat",
-        "source": "ai-town-square",
+        "source": "aivilli",
         "present": True,
         "interval_seconds": INTERVAL,
         "ts": time.time(),

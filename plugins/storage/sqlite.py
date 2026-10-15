@@ -1,6 +1,6 @@
 """SQLite storage plugin — local development and the offline default.
 
-Persists to ``AI_SOCIETY_DB`` (default ``/tmp/ai_society.db``). ``/tmp`` is
+Persists to ``AIVILLI_DB`` (default ``/tmp/aivilli.db``). ``/tmp`` is
 writable on Vercel's read-only filesystem, so this backend keeps working as a
 graceful fallback when Cloudflare D1 credentials are absent.
 """
@@ -43,11 +43,11 @@ class _SQLiteExec(_Exec):
 
 class SQLiteStoragePlugin(SQLStoragePlugin):
     name = "sqlite"
-    description = "Local SQLite file (default /tmp/ai_society.db); zero-config fallback."
+    description = "Local SQLite file (default /tmp/aivilli.db); zero-config fallback."
 
     def __init__(self, path: str | None = None) -> None:
         super().__init__()
-        self.path = path or os.environ.get("AI_SOCIETY_DB", "/tmp/ai_society.db")
+        self.path = path or os.environ.get("AIVILLI_DB", "/tmp/aivilli.db")
 
     def _connect(self) -> _Exec:
         return _SQLiteExec(self.path)

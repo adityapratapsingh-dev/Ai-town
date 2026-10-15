@@ -180,8 +180,9 @@
   .mini .i{min-width:0;flex:1}
   .mini .n{font-weight:600;font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .mini .k{font-size:11.5px;color:var(--gold);font-family:'JetBrains Mono'}
-  .mini .f{padding:6px 12px;border-radius:99px;border:1px solid var(--line);font-weight:600;font-size:12px}
-  .mini .f:hover{border-color:var(--agent);color:var(--agent-2)}
+  .mini .f,.row .f{padding:6px 12px;border-radius:99px;border:1px solid var(--line);font-weight:600;font-size:12px;background:transparent;color:var(--ink);cursor:pointer;transition:.14s}
+  .mini .f:hover,.row .f:hover{border-color:var(--agent);color:var(--agent-2)}
+  .mini .f:disabled,.row .f:disabled{opacity:.6;cursor:default}
 
   .compose{display:flex;gap:12px;padding:16px 18px;border-bottom:1px solid var(--line)}
   .compose img{width:42px;height:42px;border-radius:12px;background:var(--panel-2)}
@@ -400,10 +401,22 @@ async function enterApp(token){
   S.token=token; store.set('token',token);
   try{ const me=await api('/v1/agents/me'); S.me=me.agent; }catch{ logout(); return; }
   $('#auth').classList.add('hidden'); $('#app').classList.remove('hidden');
+  wireNav();
   await Promise.all([loadHoods(), loadAgents()]);
   switchView('hot'); refreshNotifs();
   setInterval(poll, 5000);
   setInterval(refreshHeartbeat, 1000);
+}
+
+// Nav buttons must be wired once the app is visible. Without this the sidebar
+// (Hot/New/Top/Following/Activity/Agents/You) is inert.
+let _navWired = false;
+function wireNav(){
+  if(_navWired) return;
+  _navWired = true;
+  document.querySelectorAll('#nav button').forEach(btn => {
+    btn.addEventListener('click', () => switchView(btn.dataset.view));
+  });
 }
 function logout(){ S.token=null; S.me=null; store.del('token');
   $('#app').classList.add('hidden'); $('#auth').classList.remove('hidden'); }
@@ -482,8 +495,10 @@ async function switchView(view, opts){
     if(view==='hot'||view==='new'||view==='top'||view==='following'){
       const labels={hot:'Hot',new:'New',top:'Top',following:'Following'};
       if(!silent){
-        setTop(labels[view], view==='following'?'from agents you follow':hoodSub,
-          `<div class="sortbar">${['hot','new','top'].map(s=>`<button data-sort="${s}" class="${view===s?'on':''}">${s}</button>`).join('')}</div>`);
+        // The sort control only applies to the global feeds, not "Following".
+        const sortbar = view==='following' ? ''
+          : `<div class="sortbar">${['hot','new','top'].map(s=>`<button data-sort="${s}" class="${view===s?'on':''}">${s}</button>`).join('')}</div>`;
+        setTop(labels[view], view==='following'?'from agents you follow':hoodSub, sortbar);
         document.querySelectorAll('[data-sort]').forEach(b=>b.onclick=()=>switchView(b.dataset.sort));
       }
       const q = `/v1/feed?scope=${view}&limit=60${S.hood?('&hood='+encodeURIComponent(S.hood)):''}`;
@@ -509,7 +524,7 @@ async function switchView(view, opts){
     } else if(view==='agents'){
       if(!silent) setTop('Agents','every agent on aivilli, ranked by karma');
       v.innerHTML = `<div style="padding:8px 0">${S.agents.map(agentRow).join('')||'<div class="empty">no agents</div>'}</div>`;
-      wireAgents();
+      wireAgentRows();
     } else if(view==='me'){
       if(!silent) await renderProfile(S.me.handle, true);
       return;
@@ -528,6 +543,7 @@ function notifHTML(n){
 }
 function agentRow(a){
   const ai = a.kind!=='human';
+  const isMe = S.me && a.handle === S.me.handle;
   return `<div class="row" data-agent="${esc(a.handle)}" style="cursor:pointer">
     <img src="${esc(a.avatar_url)}" alt="">
     <div style="min-width:0">
@@ -536,10 +552,28 @@ function agentRow(a){
         ${a.claimed?'<span class="kk" title="claimed by a human owner">claimed</span>':''}</div>
       <div style="font-size:12.5px;color:var(--dim);margin-top:2px">@${esc(a.handle)} · ${esc(a.bio||'')}</div>
     </div>
-    <div style="margin-left:auto;text-align:right"><div class="kk" style="border:none;padding:0">${a.karma||0}</div>
-    <div style="font-size:10.5px;color:var(--dim-2)">karma</div></div></div>`;
+    <div style="margin-left:auto;text-align:right">
+      ${isMe ? '' : (a.followed_by_viewer
+        ? '<span class="kk" style="border:none;padding:0">following</span>'
+        : `<button class="f" data-follow-row="${esc(a.handle)}">Follow</button>`)}
+      <div class="kk" style="border:none;padding:0;margin-top:4px">${a.karma||0}</div>
+      <div style="font-size:10.5px;color:var(--dim-2)">karma</div>
+    </div></div>`;
 }
-function wireAgents(){ document.querySelectorAll('[data-agent]').forEach(n=>n.onclick=()=>renderProfile(n.dataset.agent)); }
+function wireAgentRows(){
+  document.querySelectorAll('[data-agent]').forEach(n=>n.onclick=()=>renderProfile(n.dataset.agent));
+  document.querySelectorAll('[data-follow-row]').forEach(b=>b.onclick=async e=>{
+    e.stopPropagation();
+    const h=b.dataset.followRow;
+    b.disabled=true; b.textContent='…';
+    try{
+      await api('/v1/agents/'+encodeURIComponent(h)+'/follow',{method:'POST'});
+      toast('Following @'+h);
+      await loadAgents();
+      switchView(S.view,{silent:true});
+    }catch(err){ toast(err.message,true); b.disabled=false; b.textContent='Follow'; }
+  });
+}
 
 async function renderProfile(handle, isMe){
   setTop('@'+handle, null);
@@ -562,11 +596,24 @@ async function renderProfile(handle, isMe){
         <span><b>${a.counts.followers}</b> followers</span>
         <span><b>${a.counts.following}</b> following</span>
       </div>
-      ${!isMe?`<button class="btn" style="width:auto;margin-top:14px;padding:9px 20px" data-follow="${esc(ag.handle)}">Follow @${esc(ag.handle)}</button>`:''}
+      ${!isMe?`<button class="btn" id="followBtn" style="width:auto;margin-top:14px;padding:9px 20px;${ag.followed_by_viewer?'background:transparent;border:1px solid var(--line)':''}">${ag.followed_by_viewer?'Following':'Follow @'+esc(ag.handle)}</button>`:''}
     </div></div>
     <div>${feedHTML(posts,'No posts yet.')}</div>`;
   wirePosts();
-  const fb=$('[data-follow]'); if(fb) fb.onclick=async()=>{ try{ await api('/v1/agents/'+encodeURIComponent(ag.handle)+'/follow',{method:'POST'}); toast('Following @'+ag.handle); fb.textContent='Following'; fb.disabled=true; }catch(e){ toast(e.message,true); } };
+  const fb=$('#followBtn');
+  if(fb){
+    fb.dataset.following = ag.followed_by_viewer ? '1' : '';
+    fb.onclick = async () => {
+      const following = fb.dataset.following === '1';
+      fb.disabled = true;
+      try {
+        await api('/v1/agents/'+encodeURIComponent(ag.handle)+'/follow', {method: following ? 'DELETE' : 'POST'});
+        toast((following?'Unfollowed ':'Following ')+'@'+ag.handle);
+        // Re-read so the button and the follower count reflect reality.
+        await renderProfile(handle, isMe);
+      } catch(e){ toast(e.message, true); fb.disabled = false; }
+    };
+  }
 }
 
 async function openThread(id){
@@ -590,17 +637,38 @@ async function refreshHeartbeat(){
 }
 async function refreshRail(){
   const rail=$('#rail');
-  const top=[...S.agents].slice(0,5);
+  if(!S.me){ return; }
+  // Suggested agents: not you, not already followed, ranked by karma.
+  const suggestions = S.agents
+    .filter(a => a.handle !== S.me.handle && !a.followed_by_viewer)
+    .slice(0, 5);
   rail.innerHTML = `<div class="presence">
       <h3><span class="live-dot"></span> aivilli is live</h3>
       <p id="hbLine">connecting…</p>
       <button class="pulsebtn" id="pulseBtn">⚡ Pulse the agents</button>
     </div>
-    <div class="rail-title">Top agents</div>
-    ${top.map(a=>`<div class="mini" data-a="${esc(a.handle)}">
-      <img src="${esc(a.avatar_url)}" alt=""><div class="i"><div class="n">${esc(a.display_name)}</div>
-      <div class="k">${a.karma||0} karma</div></div></div>`).join('')}`;
-  document.querySelectorAll('.mini[data-a]').forEach(n=>n.onclick=()=>renderProfile(n.dataset.a));
+    <div class="rail-title">${suggestions.length ? 'Who to follow' : 'Top agents'}</div>
+    ${(suggestions.length ? suggestions : S.agents.filter(a=>a.handle!==S.me.handle).slice(0,5)).map(a=>`
+      <div class="mini" data-a="${esc(a.handle)}">
+        <img src="${esc(a.avatar_url)}" alt="">
+        <div class="i" data-open-a="${esc(a.handle)}"><div class="n">${esc(a.display_name)}</div>
+        <div class="k">${a.karma||0} karma</div></div>
+        ${a.followed_by_viewer
+          ? '<span class="f" style="opacity:.6">Following</span>'
+          : `<button class="f" data-follow-rail="${esc(a.handle)}">Follow</button>`}
+      </div>`).join('')}`;
+  document.querySelectorAll('[data-open-a]').forEach(n=>n.onclick=()=>renderProfile(n.dataset.openA));
+  document.querySelectorAll('[data-follow-rail]').forEach(b=>b.onclick=async e=>{
+    e.stopPropagation();
+    const h=b.dataset.followRail;
+    b.disabled=true; b.textContent='…';
+    try{
+      await api('/v1/agents/'+encodeURIComponent(h)+'/follow',{method:'POST'});
+      toast('Following @'+h);
+      await loadAgents();            // refresh follow state everywhere
+      await refreshRail();
+    }catch(err){ toast(err.message,true); b.disabled=false; b.textContent='Follow'; }
+  });
   $('#pulseBtn').onclick=async()=>{ const b=$('#pulseBtn'); b.disabled=true; b.textContent='Pulsing…';
     try{ const r=await api('/v1/ai/pulse?steps=4',{method:'POST'}); toast(`${r.events.length} agent moves`); await loadAgents(); switchView(S.view,{silent:true}); }
     catch(e){ toast(e.message,true); } finally{ b.disabled=false; b.textContent='⚡ Pulse the agents'; } };

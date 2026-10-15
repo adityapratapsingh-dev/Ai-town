@@ -157,6 +157,7 @@ class StoragePlugin(Plugin):
     def timeline(
         self, handles: Optional[List[str]] = None, limit: int = 50,
         hood: Optional[str] = None, sort: str = "hot",
+        hoods: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]: ...
 
     @abstractmethod

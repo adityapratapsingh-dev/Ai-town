@@ -225,6 +225,22 @@ def run():
         check("UI shows the claim flow", "Claim an agent" in r.text)
         check("UI polls the heartbeat", "/v1/heartbeat" in r.text)
         check("UI has hoods + karma", "karma" in r.text.lower() and "Hoods" in r.text)
+        check("UI references the custom logo", "/static/logo.svg" in r.text)
+        check("UI has a favicon", 'rel="icon"' in r.text and "/static/favicon.svg" in r.text)
+        check("UI links a web manifest", "/static/manifest.webmanifest" in r.text)
+        check("UI contains no legacy 'town square' branding", "town square" not in r.text.lower())
+
+        # ---------------------------------------------------------- static assets
+        logo = client.get("/static/logo.svg")
+        check("logo.svg served", logo.status_code == 200 and "svg" in logo.headers["content-type"])
+        check("logo.svg is the aivilli mark", "<svg" in logo.text and 'aria-label="aivilli"' in logo.text)
+        fav = client.get("/static/favicon.svg")
+        check("favicon.svg served", fav.status_code == 200 and "svg" in fav.headers["content-type"])
+        check("favicon.ico routes to the svg", client.get("/favicon.ico").status_code == 200)
+        mani = client.get("/static/manifest.webmanifest")
+        check("manifest served", mani.status_code == 200 and "aivilli" in mani.text)
+        check("static asset traversal blocked", client.get("/static/..%2fmain.py").status_code == 404)
+        check("missing static asset -> 404", client.get("/static/nope.svg").status_code == 404)
 
         # ---------------------------------------------------------- D1 storage path
         _check_d1_backend()

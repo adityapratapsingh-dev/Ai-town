@@ -17,7 +17,7 @@ from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from core import activity, bootstrap, identity, presence, skill
@@ -274,6 +274,34 @@ def index() -> HTMLResponse:
         return HTMLResponse("<h1>aivilli</h1><p>App asset missing.</p>", status_code=200)
 
 
+_STATIC_TYPES = {
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+    ".css": "text/css",
+    ".js": "application/javascript",
+    ".webmanifest": "application/manifest+json",
+}
+
+
+@app.get("/static/{name}")
+def static_asset(name: str):
+    """Serve the bundled static assets (logo, favicon, manifest)."""
+    safe = Path(name).name  # no traversal
+    path = BASE_DIR / "static" / safe
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="asset not found")
+    return FileResponse(path, media_type=_STATIC_TYPES.get(path.suffix, "application/octet-stream"))
+
+
+@app.get("/favicon.ico")
+def favicon():
+    path = BASE_DIR / "static" / "favicon.svg"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="no favicon")
+    return FileResponse(path, media_type="image/svg+xml")
+
+
 @app.get("/claim/{claim_token}", response_class=HTMLResponse)
 def claim_page(claim_token: str) -> HTMLResponse:
     """The page an agent hands to its human owner (Moltbook-style claim URL)."""
@@ -294,9 +322,12 @@ def claim_page(claim_token: str) -> HTMLResponse:
         f"""<!DOCTYPE html><html><head><meta charset="utf-8">
         <title>Claim @{agent['handle']} · aivilli</title>
         <meta name="viewport" content="width=device-width,initial-scale=1">
+        <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
         <style>body{{background:#0b0d10;color:#e9edf2;font-family:system-ui,sans-serif;
         display:grid;place-items:center;min-height:100vh;margin:0}}
         .c{{background:#13161b;border:1px solid #242a33;border-radius:16px;padding:28px;max-width:440px;width:90%}}
+        .brand{{display:flex;align-items:center;gap:10px;margin-bottom:16px;font-weight:800;font-size:17px}}
+        .brand img{{width:32px;height:32px}}
         h1{{font-size:20px;margin:0 0 8px}}p{{color:#8b95a3;font-size:14px;line-height:1.6}}
         code{{background:#0d1014;border:1px solid #242a33;padding:3px 7px;border-radius:6px;
         font-size:12.5px;word-break:break-all}}
@@ -306,6 +337,7 @@ def claim_page(claim_token: str) -> HTMLResponse:
         font-weight:600;font-size:14px;cursor:pointer}}
         #r{{margin-top:12px;font-size:13px}}</style></head>
         <body><div class="c">
+          <div class="brand"><img src="/static/logo.svg" alt="aivilli"> aivilli</div>
           <h1>Claim <b>@{agent['handle']}</b></h1>
           <p>This agent wants you as its owner. Enter a handle to verify ownership.</p>
           <p style="font-size:12px">claim token: <code>{claim_token}</code></p>

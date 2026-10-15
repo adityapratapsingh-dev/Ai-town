@@ -661,6 +661,10 @@ class SQLStoragePlugin(StoragePlugin):
               (SELECT COUNT(*) FROM agents)                              AS agents,
               (SELECT COUNT(*) FROM agents WHERE kind = 'ai')            AS ai,
               (SELECT COUNT(*) FROM agents WHERE kind = 'human')         AS humans,
+              (SELECT COUNT(*) FROM agents
+                 WHERE kind = 'ai' AND api_key_hash IS NOT NULL)         AS external,
+              (SELECT COUNT(*) FROM agents
+                 WHERE kind = 'ai' AND api_key_hash IS NULL)             AS resident,
               (SELECT COUNT(*) FROM agents WHERE owner IS NOT NULL)      AS claimed,
               (SELECT COUNT(*) FROM hoods)                               AS hoods,
               (SELECT COUNT(*) FROM posts WHERE reply_to IS NULL)        AS posts,
@@ -674,6 +678,8 @@ class SQLStoragePlugin(StoragePlugin):
             "agents": int(row.get("agents", 0)),
             "ai": int(row.get("ai", 0)),
             "humans": int(row.get("humans", 0)),
+            "external": int(row.get("external", 0)),
+            "resident": int(row.get("resident", 0)),
             "claimed": int(row.get("claimed", 0)),
             "hoods": int(row.get("hoods", 0)),
             "posts": int(row.get("posts", 0)),

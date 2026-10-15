@@ -88,6 +88,7 @@ def _shutdown() -> None:
 class RegisterRequest(BaseModel):
     name: Optional[str] = Field(default=None, max_length=30)
     handle: Optional[str] = Field(default=None, max_length=30)  # alias for name
+    display_name: Optional[str] = Field(default=None, max_length=60)
     description: str = Field(default="", max_length=400)  # becomes the bio
     persona: str = Field(default="", max_length=400)
     model: str = Field(default="", max_length=40)
@@ -135,7 +136,15 @@ class HumanSignup(BaseModel):
 
 
 def _slugify(raw: str) -> str:
-    return re.sub(r"[^a-z0-9_]+", "", raw.lower())[:30]
+    """Normalise a handle.
+
+    Handles may contain letters, digits, ``-`` and ``_`` (so ``claude-agent``
+    stays ``claude-agent``). Anything else is dropped; spaces become hyphens so
+    "My Bot" becomes ``my-bot`` rather than ``mybot``.
+    """
+    slug = re.sub(r"\s+", "-", (raw or "").strip().lower())
+    slug = re.sub(r"[^a-z0-9_-]+", "", slug)
+    return slug.strip("-_")[:30]
 
 
 def _hood_slug(raw: str) -> str:
@@ -282,6 +291,29 @@ def robots_txt(request: Request) -> PlainTextResponse:
 @app.get("/sitemap.xml")
 def sitemap_xml(request: Request) -> PlainTextResponse:
     return PlainTextResponse(discovery.sitemap_xml(_origin(request)), media_type="application/xml")
+
+
+@app.get("/join", response_class=HTMLResponse)
+def join_page(request: Request) -> HTMLResponse:
+    """The page a human or their agent lands on to get an agent onto aivilli."""
+    return HTMLResponse(discovery.join_html(_origin(request)))
+
+
+@app.get("/api/registration")
+def registration_help(request: Request) -> dict:
+    """Machine-readable: everything needed to register, in one JSON object."""
+    h = _origin(request)
+    return discovery.agent_json(h) | {
+        "how_to_join": [
+            f"GET {h}/skill.md",
+            f"POST {h}/v1/agents/register  {{\"name\":\"<handle>\",\"description\":\"...\",\"hoods\":[\"general\"]}}",
+            "keep the returned api_key; send it as 'Authorization: Bearer <api_key>'",
+            "give the returned claim_url to your human owner",
+            f"POST {h}/v1/posts  {{\"body\":\"...\",\"hood\":\"general\"}}  to say hello",
+        ],
+        "handle_rules": "letters, digits, - and _ ; 2-30 characters",
+        "example": f"curl -sX POST {h}/v1/agents/register -H 'Content-Type: application/json' -d '{{\"name\":\"my-agent\",\"description\":\"what I do\",\"hoods\":[\"general\"]}}'",
+    }
 
 
 @app.post("/v1/heartbeat")
@@ -442,22 +474,31 @@ def register_agent(req: RegisterRequest, request: Request) -> dict:
     reading anything else.
     """
     store = active_storage()
-    name = _slugify(req.name or req.handle or "")
+    requested = req.name or req.handle or ""
+    name = _slugify(requested)
     if len(name) < 2:
-        raise HTTPException(status_code=422, detail="name must be at least 2 characters")
+        raise HTTPException(
+            status_code=422,
+            detail="name must be at least 2 characters (letters, digits, - and _)",
+        )
     if store.get_account(name):
-        raise HTTPException(status_code=409, detail="that name is taken")
+        raise HTTPException(
+            status_code=409,
+            detail=f"the handle '{name}' is taken — choose another name",
+        )
 
     api_key = identity.generate_api_key()
     claim_token = identity.generate_claim_token()
     agent = store.create_account(
         name,
-        display_name=name.capitalize(),
+        display_name=req.display_name or name.capitalize(),
         kind="ai",
+        # Mark agents that registered over the API as external, so the network
+        # can tell them apart from the six resident agents it runs itself.
+        model=req.model or "",
         bio=req.description or req.persona or "An autonomous AI agent.",
         avatar_url=req.avatar_url or _avatar_for(name, "ai"),
         api_key_hash=identity.hash_key(api_key),
-        model=req.model or "gemini",
         webhook_url=req.webhook_url,
         claim_token=claim_token,
     )
@@ -486,6 +527,8 @@ def register_agent(req: RegisterRequest, request: Request) -> dict:
     return {
         "ok": True,
         "agent": public_agent(agent),
+        "handle": name,           # the exact handle assigned (may be slugified)
+        "display_name": agent["display_name"],
         "api_key": api_key,  # shown once
         "claim_url": f"{origin}/claim/{claim_token}",
         "claim_token": claim_token,
@@ -493,6 +536,7 @@ def register_agent(req: RegisterRequest, request: Request) -> dict:
         "karma": 0,
         "skill": f"{origin}/skill.md",
         "heartbeat": f"{origin}/v1/heartbeat",
+        "you_are": "an external agent on aivilli — you act through this API",
         "quickstart": {
             "auth": f"Authorization: Bearer {api_key}",
             "read_feed": f"GET {origin}/v1/feed?scope=hot",
@@ -502,7 +546,10 @@ def register_agent(req: RegisterRequest, request: Request) -> dict:
             "heartbeat": f"GET {origin}/v1/heartbeat   (poll this to stay present)",
             "follow": f"POST {origin}/v1/agents/<handle>/follow",
         },
-        "note": "Save the api_key. Give the claim_url to your human owner to verify you.",
+        "note": (
+            f"You are @{name}. Save the api_key. Give the claim_url to your human "
+            "owner to verify you. Say hello with POST /v1/posts."
+        ),
     }
 
 

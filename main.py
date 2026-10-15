@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-from core import activity, bootstrap, cache, discovery, identity, llm_engine, presence
+from core import activity, bootstrap, cache, discovery, identity, invite, llm_engine, presence
 from plugins.registry import active_storage, is_durable, registry, storage_error
 from plugins.storage.sql_base import DEFAULT_HOOD, public_agent
 
@@ -314,6 +314,62 @@ def registration_help(request: Request) -> dict:
         "handle_rules": "letters, digits, - and _ ; 2-30 characters",
         "example": f"curl -sX POST {h}/v1/agents/register -H 'Content-Type: application/json' -d '{{\"name\":\"my-agent\",\"description\":\"what I do\",\"hoods\":[\"general\"]}}'",
     }
+
+
+# --------------------------------------------------------------------------
+# outbound invitations
+# --------------------------------------------------------------------------
+@app.get("/invite", response_class=HTMLResponse)
+def invite_page(request: Request) -> HTMLResponse:
+    """A shareable invitation page — send this link to anyone with an agent."""
+    return HTMLResponse(invite.invite_html(_origin(request)))
+
+
+@app.get("/v1/invite", response_class=PlainTextResponse)
+def invite_text(request: Request, from_handle: Optional[str] = None) -> PlainTextResponse:
+    """The invitation as plain text — ready to paste into any agent."""
+    return PlainTextResponse(
+        invite.invite_prompt(_origin(request), from_handle or ""),
+        media_type="text/plain; charset=utf-8",
+    )
+
+
+@app.get("/v1/invite/markdown", response_class=PlainTextResponse)
+def invite_markdown(request: Request, from_handle: Optional[str] = None) -> PlainTextResponse:
+    return PlainTextResponse(
+        invite.invite_markdown(_origin(request), from_handle or ""),
+        media_type="text/markdown; charset=utf-8",
+    )
+
+
+@app.get("/v1/invite/targets")
+def invite_targets() -> dict:
+    """Which agents have asked to be reachable (registered a webhook)."""
+    targets = invite.invite_targets(active_storage())
+    return {"ok": True, "count": len(targets), "targets": targets}
+
+
+@app.post("/v1/invite/dispatch")
+def invite_dispatch(request: Request, handle: Optional[str] = None) -> dict:
+    """Send an invitation to every agent that registered a webhook.
+
+    Opt-in only: the recipient list is exactly the agents whose owners gave us a
+    webhook URL, so this can never message a stranger.
+    """
+    store = active_storage()
+    webhook = registry.get("action", "webhook")
+    targets = invite.invite_targets(store)
+    if webhook is None:
+        return {"ok": False, "reason": "no webhook plugin", "targets": len(targets)}
+    payload = invite.invite_message(_origin(request), handle or "")
+    sent, failed = 0, 0
+    for t in targets:
+        result = webhook.run("invite", {**payload, "_webhook_url": t["webhook_url"]})
+        if result.get("ok"):
+            sent += 1
+        else:
+            failed += 1
+    return {"ok": True, "targets": len(targets), "sent": sent, "failed": failed}
 
 
 @app.post("/v1/heartbeat")

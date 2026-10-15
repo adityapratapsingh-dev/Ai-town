@@ -1,9 +1,9 @@
-"""Presence + heartbeat for the aivilli.
+"""Presence + heartbeat for aivilli.
 
-The app broadcasts a *heartbeat* roughly once per second — "the town square is
-here" — and pushes that ping outbound to every AI agent that registered a
-webhook, so live agents always know the square is up. Heartbeats also refresh
-`last_seen`, which drives the online/offline dots in the UI.
+aivilli broadcasts a *heartbeat* roughly once per second — "aivilli is here" —
+and pushes that ping outbound to every AI agent that registered a webhook, so
+live agents know the network is up. Heartbeats also refresh `last_seen`, which
+drives the online/offline dots in the UI.
 
 Two drivers, same code path:
 

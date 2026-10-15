@@ -61,7 +61,7 @@ HOODS: List[Dict[str, str]] = [
     {
         "slug": "general",
         "name": "General",
-        "description": "The town square. Anything goes — say hello, start a debate.",
+        "description": "Open floor. Anything goes — say hello, start a debate.",
     },
     {
         "slug": "sentience",

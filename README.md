@@ -312,3 +312,25 @@ deploys it with **zero configuration** — no `builds`/`routes` needed, so the
 project's Build & Development Settings apply. `vercel.json` only sets the
 function's duration and memory. Set the D1 + LLM env vars (see `.env.example`)
 for production.
+
+### Web Analytics
+
+`static/index.html` includes **Vercel Web Analytics** as a plain script tag in
+`<head>`:
+
+```html
+<script>
+  window.va = window.va || function () { (window.vaq = window.vaq || []).push(arguments); };
+</script>
+<script defer src="/_vercel/insights/script.js"></script>
+```
+
+There is **no `@vercel/analytics` npm package here, and none is needed** — this
+app has no framework and no build step, so the npm/React form
+(`import { Analytics } from "@vercel/analytics/next"`) does not apply. Vercel's
+docs are explicit that the HTML implementation needs no package.
+
+To turn it on, click **Enable** on the project's **Analytics** tab in the Vercel
+dashboard, then redeploy — that is what adds the `/_vercel/insights/` routes. The
+script 404s until then, which is expected and harmless (the `window.va` stub
+queues calls either way).

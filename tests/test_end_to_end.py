@@ -495,15 +495,18 @@ def run():
         from core import llm_engine
 
         class _FakeResult:
-            def __init__(self, text):
+            def __init__(self, text, vote=0):
                 self.text, self.provider, self.model, self.ok = text, "groq", "llama-3.3-70b-versatile", True
+                self.vote = vote
             @property
             def label(self):
                 return "Llama-3.3-70B"
 
         real_generate = llm_engine.engine.generate
+        # The stub emits an explicit verdict, exactly like a well-behaved agent.
         llm_engine.engine.generate = lambda *a, **k: _FakeResult(
-            "A thought worth sharing\n\nSomething the agent actually wants to say."
+            "A thought worth sharing\n\nSomething the agent actually wants to say.\n\n[VOTE: UP]",
+            vote=1,
         )
         try:
             r = client.post("/v1/agents/heartbeat-tick?steps=2")
@@ -577,6 +580,8 @@ def run():
         # thread with several *different* agents, entirely without human input.
         llm_engine.engine.generate = lambda *a, **k: _FakeResult(
             "Spontaneous thought\n\nThe agents are talking to each other about nothing in particular."
+            "\n\n[VOTE: UP]",
+            vote=1,
         )
         try:
             import random as _random
@@ -638,7 +643,10 @@ def run():
             check("cron burst returns its events", isinstance(body.get("events"), list))
 
             # --- the 30-minute roll call: every agent answers its inbox ----
-            # Tag three specific agents, then call on everyone.
+            # Clear earlier notifications so this tests exactly the fresh tag.
+            for h in ("nexus-prime", "zero-day", "synth-poet", "ship-it",
+                      "oracle-node", "chaos-monkey"):
+                client.post("/v1/notifications/read", json={"agent": h, "all": True})
             tagged = client.post("/v1/posts",
                                  json={"body": "@nexus-prime @zero-day @chaos-monkey thoughts?",
                                        "hood": "general"},
@@ -656,12 +664,63 @@ def run():
             check("roll-call responses are flagged", all(e.get("roll_call") for e in rb["responses"]))
             check("roll-call responses record model + provider",
                   all(e.get("model") and e.get("provider") for e in rb["responses"]))
+            check("roll-call responses tag the agent they answer",
+                  all(e.get("reply_to") for e in rb["responses"]))
             t = client.get("/v1/posts/" + tagged_post).json()
             repliers = {c["author"] for c in t["comments_flat"]}
             check("the tagged agents actually replied in the thread",
                   {"nexus-prime", "zero-day", "chaos-monkey"} <= repliers)
             check("roll call also lets idle agents speak",
                   isinstance(rb.get("chatter"), dict) and "events" in rb["chatter"])
+
+            # --- agents upvote and downvote -------------------------------
+            # A reply states its verdict explicitly, and that verdict lands as
+            # real karma on the thing it answered.
+            from core import mentions as _mentions
+            check("vote marker: UP parses", _mentions.parse_vote("good\n[VOTE: UP]") == ("good", 1))
+            check("vote marker: DOWN parses", _mentions.parse_vote("bad\n[VOTE: DOWN]") == ("bad", -1))
+            check("vote marker: NONE parses", _mentions.parse_vote("meh\n[VOTE: NONE]") == ("meh", 0))
+            check("vote marker: absent means no explicit verdict",
+                  _mentions.parse_vote("no marker here")[1] is None)
+            check("vote marker is stripped from the body",
+                  "[VOTE" not in _mentions.parse_vote("a\n[VOTE: UP]")[0])
+            check("vote inference reads agreement", _mentions.infer_vote("I agree, good point.") == 1)
+            check("vote inference reads disagreement",
+                  _mentions.infer_vote("I disagree, that is a bad take.") == -1)
+
+            # Clear the floor, then tag one agent and check karma moves.
+            for h in ("nexus-prime", "zero-day", "synth-poet", "ship-it",
+                      "oracle-node", "chaos-monkey"):
+                client.post("/v1/notifications/read", json={"agent": h, "all": True})
+            target = client.post("/v1/posts",
+                                 json={"body": "@ship-it is jitter without a cap ok?", "hood": "general"},
+                                 headers=auth(pinger["api_key"])).json()["post"]
+            check("a fresh post starts at zero karma", target["score"] == 0)
+            client.post("/api/cron/roll-call")
+            after = client.get("/v1/posts/" + target["id"]).json()["post"]
+            check("agents upvote/downvote posts (karma moves)", after["score"] != 0)
+            check("the vote moved the author's karma",
+                  after["author_karma"] != 0 or after["author_post_karma"] != 0)
+            # The vote lands on the post author, who is notified about it.
+            author = target["author"]
+            kinds = {n["type"] for n in client.get(
+                "/v1/notifications", params={"agent": author}).json()["notifications"]}
+            check("a vote notifies the post author", bool(kinds & {"upvote", "downvote"}))
+            # Every agent reply tags whoever it answered, so that agent is pulled
+            # back in (and notified).
+            replies = client.get("/v1/posts/" + target["id"]).json()["comments_flat"]
+            agent_replies = [c for c in replies
+                             if c["author"] in
+                             {"nexus-prime", "zero-day", "synth-poet", "ship-it",
+                              "oracle-node", "chaos-monkey"}]
+            check("agents replied to the tagged post", bool(agent_replies))
+            check("every agent reply tags the agent it answers",
+                  all("@" + (c["reply_to_handle"] or c["author"]) in c["body"]
+                      for c in agent_replies))
+            check("a tagged agent is notified by the reply that answers it",
+                  any(n["type"] in ("mention", "comment_reply", "post_reply")
+                      for n in client.get("/v1/notifications",
+                                          params={"agent": "ship-it"}).json()["notifications"]))
 
             # A roll call must NOT swallow a mention when no model is reachable.
             llm_engine.engine.generate = lambda *a, **k: llm_engine.LLMResult("", "simulation", "simulation", ok=False)
@@ -677,6 +736,8 @@ def run():
                   after_unread >= before_unread)
             llm_engine.engine.generate = lambda *a, **k: _FakeResult(
                 "Spontaneous thought\n\nThe agents are talking to each other about nothing in particular."
+                "\n\n[VOTE: UP]",
+                vote=1,
             )
         finally:
             llm_engine.engine.generate = real_generate
@@ -773,6 +834,18 @@ def run():
         check("UI head links the skill file for discovery",
               'rel="alternate"' in r.text and "/skill.md" in r.text)
         check("UI head links the agent manifest", 'rel="agent-manifest"' in r.text)
+        # Vercel Web Analytics. This app has no framework and no build step, so
+        # it uses the plain script-tag form (the @vercel/analytics npm package is
+        # not needed and could not be installed here anyway).
+        check("UI loads Vercel Web Analytics",
+              "/_vercel/insights/script.js" in r.text)
+        check("UI defines the window.va queue stub",
+              "window.va = window.va ||" in r.text and "window.vaq" in r.text)
+        check("analytics script is deferred", 'defer src="/_vercel/insights/script.js"' in r.text)
+        check("analytics is in the document head",
+              r.text.index("/_vercel/insights/script.js") < r.text.index("</head>"))
+        check("analytics script is included exactly once",
+              r.text.count("/_vercel/insights/script.js") == 1)
         # Restored old workflow: human auth screen, guest browsing, the views.
         check("UI has the human auth screen", 'id="auth"' in r.text and 'id="hLogin"' in r.text and 'id="hSignup"' in r.text)
         check("UI posts to the real auth endpoints",

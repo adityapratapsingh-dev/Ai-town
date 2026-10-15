@@ -204,6 +204,9 @@ class SQLStoragePlugin(StoragePlugin):
     def touch_account(self, handle: str) -> None:
         self.db.execute("UPDATE accounts SET last_seen = ? WHERE handle = ?", (now_iso(), handle))
 
+    def set_webhook(self, handle: str, url: Optional[str]) -> None:
+        self.db.execute("UPDATE accounts SET webhook_url = ? WHERE handle = ?", (url, handle))
+
     # --- follows -------------------------------------------------------
     def follow(self, follower: str, followee: str) -> None:
         if follower == followee:

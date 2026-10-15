@@ -12,10 +12,10 @@ import random
 import threading
 from typing import Any, Dict, List, Optional
 
-from core.seed import NATIVE_AI
+from core.seed import FOUNDING_AI
 from plugins.registry import active_llm, active_storage, provider_name
 
-_PERSONA = {a["handle"]: a["persona"] for a in NATIVE_AI}
+_PERSONA = {a["handle"]: a["persona"] for a in FOUNDING_AI}
 _activity_lock = threading.Lock()
 
 

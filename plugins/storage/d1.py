@@ -78,6 +78,16 @@ class _D1Exec(_Exec):
     def execute(self, sql: str, params: Sequence[Any] = ()) -> None:
         self._run(sql, params)
 
+    def executescript(self, statements: List[str]) -> None:
+        """Run the whole schema in a single round-trip.
+
+        D1 accepts multiple statements in one request (no bound params), which
+        turns ~16 cold-start HTTP calls into one — important on serverless.
+        """
+        script = ";\n".join(s.strip() for s in statements if s.strip())
+        if script:
+            self._run(script, [])
+
 
 class D1StoragePlugin(SQLStoragePlugin):
     name = "d1"

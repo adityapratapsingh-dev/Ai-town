@@ -79,7 +79,14 @@ class _D1Exec(_Exec):
                     raise httpx.HTTPStatusError(
                         f"transient {resp.status_code}", request=resp.request, response=resp
                     )
-                resp.raise_for_status()
+                if resp.status_code >= 400:
+                    # D1 returns the *real* reason in the JSON body. Read it and
+                    # raise it verbatim: a bare "400 Bad Request" hides whether
+                    # it is a bad token, a bad database id, or a bad SQL
+                    # statement — which makes outages very hard to diagnose.
+                    raise RuntimeError(
+                        f"D1 HTTP {resp.status_code}: {self._error_text(resp)}"
+                    )
                 body = resp.json()
                 if not body.get("success", False):
                     raise RuntimeError(f"D1 query failed: {body.get('errors')}")
@@ -104,6 +111,24 @@ class _D1Exec(_Exec):
             raise last_exc
         return []
 
+    @staticmethod
+    def _error_text(resp: "httpx.Response") -> str:
+        """Extract D1's human-readable error from a non-2xx response body."""
+        try:
+            body = resp.json()
+        except Exception:
+            return (resp.text or "")[:200] or "no body"
+        errs = body.get("errors") or []
+        if errs and isinstance(errs, list):
+            msgs = [str(e.get("message") or e) for e in errs if isinstance(e, dict)]
+            if msgs:
+                return "; ".join(msgs)[:300]
+        # Some failures put the reason under result[0] instead.
+        result = body.get("result")
+        if isinstance(result, list) and result and isinstance(result[0], dict):
+            return str(result[0].get("results") or result[0])[:300]
+        return str(body)[:300]
+
     def query(self, sql: str, params: Sequence[Any] = ()) -> List[dict]:
         return [dict(r) for r in self._run(sql, params)]
 
@@ -118,7 +143,11 @@ class _D1Exec(_Exec):
         prepared SQL statement must contain only one statement"). A schema
         failure here is fatal — the caller would fall back to ephemeral SQLite
         and silently lose every write — so try the fast single-request path and,
-        on any failure, fall back to executing the statements one by one.
+        on any failure, execute the statements one by one.
+
+        In the per-statement path, `CREATE TABLE IF NOT EXISTS` on an existing
+        (legacy) table is a no-op that cannot fail, so a single bad statement
+        must not abort the rest; only raise if *every* statement failed.
         """
         script = ";\n".join(s.strip() for s in statements if s.strip())
         if not script:
@@ -126,11 +155,21 @@ class _D1Exec(_Exec):
         try:
             self._run(script, [])
             return
-        except Exception:
-            # Multi-statement rejected: run each statement on its own.
+        except Exception as first_error:
+            # Multi-statement rejected: run each statement on its own. Only fail
+            # if nothing succeeded at all (a genuine, systemic problem).
+            ok = 0
+            last: Exception | None = None
             for stmt in statements:
-                if stmt.strip():
+                if not stmt.strip():
+                    continue
+                try:
                     self._run(stmt, [])
+                    ok += 1
+                except Exception as exc:
+                    last = exc
+            if ok == 0:
+                raise last or first_error
 
 
 class D1StoragePlugin(SQLStoragePlugin):

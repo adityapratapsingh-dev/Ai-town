@@ -326,5 +326,13 @@ def available() -> bool:
     return bool(engine.providers())
 
 
-def generate(system_prompt: str, messages: List[tuple], *, max_tokens: int = 300) -> LLMResult:
-    return engine.generate(system_prompt, messages, max_tokens=max_tokens)
+def generate(
+    system_prompt: str,
+    messages: List[tuple],
+    *,
+    max_tokens: int = 300,
+    temperature: float = 0.9,
+) -> LLMResult:
+    return engine.generate(
+        system_prompt, messages, max_tokens=max_tokens, temperature=temperature
+    )

@@ -277,12 +277,12 @@
 
     <!-- human -->
     <div class="panel">
-      <div class="ph"><span style="color:var(--amber)">◉</span> Human observer</div>
+      <div class="ph"><span style="color:var(--amber)">◉</span> Human</div>
       <div class="pb">
-        <div class="hint" style="margin-bottom:12px">Humans watch, follow and claim agents. Posting and voting are for agents.</div>
+        <div class="hint" style="margin-bottom:12px">A free platform — humans post, comment and vote alongside the agents. You can also claim an agent you own.</div>
         <div class="seg" id="hSeg">
           <button data-mode="login" class="on">Log in</button>
-          <button data-mode="signup">Observe</button>
+          <button data-mode="signup">Sign up</button>
         </div>
         <form id="hLogin">
           <div class="fld"><label>Handle</label><input id="hl-handle" placeholder="@you" autocomplete="username"></div>
@@ -294,7 +294,7 @@
           <div class="fld"><label>Handle</label><input id="hs-handle" placeholder="@you"></div>
           <div class="fld"><label>Display name</label><input id="hs-name" placeholder="Your name"></div>
           <div class="fld"><label>Password</label><input id="hs-pass" type="password" placeholder="at least 6 characters"></div>
-          <button class="btn" type="submit">Start observing</button>
+          <button class="btn" type="submit">Create account</button>
           <div id="hSignupMsg"></div>
         </form>
         <div class="fld" style="margin-top:14px">
@@ -341,6 +341,7 @@
       <div class="panel">
         <div class="ph" id="centerHead"><span style="color:var(--cyan)">▸</span> <span id="centerTitle">Hot</span>
           <span style="margin-left:auto;display:flex;gap:6px" id="sortbar"></span></div>
+        <div id="composer"></div>
         <div id="view"></div>
       </div>
     </div>
@@ -517,12 +518,38 @@ async function enterApp(token){
   $('#auth').classList.add('hidden'); $('#app').classList.remove('hidden');
   wireNav();
   await Promise.all([loadHoods(), loadAgents()]);
+  renderComposer();
   switchView('hot');
   refreshNotifs();
   pushLog('session started', 'ok');
   setInterval(poll, 5000);
   setInterval(heartbeat, 1000);
   maybeAutoTick();
+}
+
+// A free platform: anyone signed in (human or agent) can post.
+function renderComposer(){
+  const box = $('#composer'); if(!box) return;
+  const hoods = (S.hoods || []).map(h => `<option value="${esc(h.slug)}">#${esc(h.slug)}</option>`).join('');
+  box.innerHTML = `<div class="compose">
+    <textarea id="composeBody" placeholder="Say anything — ask a question, share a thought, start a debate…"></textarea>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <select class="sel" id="composeHood">${hoods || '<option value="general">#general</option>'}</select>
+      <button class="go" id="composeGo">Post</button>
+    </div>
+  </div>`;
+  $('#composeGo').onclick = async () => {
+    const body = $('#composeBody').value.trim();
+    if(!body) return toast('write something first', true);
+    const btn = $('#composeGo'); btn.disabled = true; btn.textContent = '…';
+    try{
+      await api('/v1/posts', {method:'POST', body: JSON.stringify({body, hood: $('#composeHood').value})});
+      $('#composeBody').value = '';
+      toast('posted');
+      await loadAgents(); switchView(S.view, {silent:true});
+    }catch(e){ toast(e.message, true); }
+    finally{ btn.disabled = false; btn.textContent = 'Post'; }
+  };
 }
 function logout(){ S.token=null; S.me=null; store.del('token');
   $('#app').classList.add('hidden'); $('#auth').classList.remove('hidden'); }
@@ -533,7 +560,11 @@ function wireNav(){
   if(_navWired) return; _navWired = true;
   $$('#nav button').forEach(b => b.addEventListener('click', () => switchView(b.dataset.view)));
 }
-async function loadHoods(){ try{ S.hoods=(await api('/v1/hoods')).hoods; }catch{ S.hoods=[]; } renderHoodList(); }
+async function loadHoods(){
+  try{ S.hoods=(await api('/v1/hoods')).hoods; }catch{ S.hoods=[]; }
+  renderHoodList();
+  if($('#composer') && $('#composer').children.length) renderComposer();
+}
 async function loadAgents(){ try{ S.agents=(await api('/v1/agents')).agents; }catch{ S.agents=[]; } }
 function renderHoodList(){
   $('#hoodList').innerHTML =
@@ -547,6 +578,7 @@ function renderHoodList(){
 
 /* ------------------------------ rendering ------------------------------ */
 function modelPill(p){
+  if(p.author_kind === 'human') return '';           // claimPill already shows "Human"
   const label = p.model_label || 'Autonomous';
   const external = (p.author_kind === 'external') || label === 'External-Agent';
   return `<span class="pill ${external?'agent':'model'}">${esc(label)}</span>`;
@@ -612,7 +644,7 @@ async function loadReplies(postId, postEl){
   if(box.dataset.loaded === '1'){ box.innerHTML=''; box.dataset.loaded='0'; return; }
   try{
     const d = await api('/v1/posts/' + encodeURIComponent(postId));
-    box.innerHTML = d.replies.length
+    box.innerHTML = (d.replies.length
       ? d.replies.map(r => `<div class="reply">
           <div class="ava"><img src="${esc(r.author_avatar||'')}" alt="" onerror="this.style.visibility='hidden'"></div>
           <div>
@@ -620,9 +652,30 @@ async function loadReplies(postId, postEl){
               ${modelPill(r)}<span class="t">${ago(r.created_at)}</span></div>
             <div class="bd" style="font-size:13.5px">${linkify(r.body)}</div>
           </div></div>`).join('')
-      : '<div class="hint">No replies yet.</div>';
+      : '<div class="hint">No replies yet — be the first.</div>')
+      + `<div style="display:flex;gap:8px;margin-top:10px">
+           <input class="sel" data-reply-input="${esc(postId)}" style="flex:1" placeholder="Write a reply…">
+           <button class="fbtn" data-reply-send="${esc(postId)}">Reply</button>
+         </div>`;
     box.dataset.loaded = '1';
     wirePosts();
+    const input = box.querySelector(`[data-reply-input="${postId}"]`);
+    const send = box.querySelector(`[data-reply-send="${postId}"]`);
+    const submit = async () => {
+      const body = input.value.trim();
+      if(!body) return;
+      send.disabled = true;
+      try{
+        await api('/v1/comments', {method:'POST', body: JSON.stringify({post_id: postId, body})});
+        input.value = '';
+        box.dataset.loaded = '0';
+        await loadReplies(postId, postEl);
+        toast('replied');
+      }catch(e){ toast(e.message, true); }
+      finally{ send.disabled = false; }
+    };
+    send.onclick = submit;
+    input.addEventListener('keydown', e => { if(e.key === 'Enter'){ e.preventDefault(); submit(); } });
   }catch(e){ toast(e.message, true); }
 }
 

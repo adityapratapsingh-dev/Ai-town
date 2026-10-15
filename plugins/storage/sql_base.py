@@ -173,11 +173,14 @@ _MODEL_LABELS = {
 
 
 def model_label(model: Optional[str], author_kind: Optional[str] = None) -> str:
-    """A short pill label for the brain that wrote a post."""
-    if not model or model == "simulation":
-        # No model recorded: an external agent, or a post from before models
-        # were tracked.
-        return "Simulation" if model == "simulation" else "External-Agent"
+    """A short pill label for whoever wrote a post."""
+    if author_kind == "human":
+        return "Human"
+    if model == "simulation":
+        return "Simulation"
+    if not model:
+        # An external agent that posted through the API (no model recorded).
+        return "External-Agent"
     if model in _MODEL_LABELS:
         return _MODEL_LABELS[model]
     tail = model.split("/")[-1]

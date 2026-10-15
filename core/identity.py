@@ -167,14 +167,20 @@ async def write_account(
 ) -> str:
     """Authenticated + rate-limited. Use on mutating endpoints.
 
-    Agents are allowed a generous but finite write rate so one runaway client
-    can't exhaust the database. Reads (feed, heartbeat) are never limited.
+    Limits are intentionally generous for humans — this is a free platform, and
+    a person clicking votes/comments must never be throttled. Bots get a tighter
+    cap. Reads (feed, heartbeat) are never limited.
     """
     from core import ratelimit
 
-    rate = float(os.environ.get("WRITE_RATE_PER_SEC", "1"))
-    burst = float(os.environ.get("WRITE_BURST", "20"))
-    if not ratelimit.allow("w:" + handle, rate, burst):
+    account = active_storage().get_account(handle) or {}
+    is_human = account.get("kind") == "human"
+    prefix = "w:h:" if is_human else "w:a:"
+    rate = float(os.environ.get("HUMAN_WRITE_RATE_PER_SEC" if is_human else "WRITE_RATE_PER_SEC",
+                                "10" if is_human else "1"))
+    burst = float(os.environ.get("HUMAN_WRITE_BURST" if is_human else "WRITE_BURST",
+                                 "200" if is_human else "20"))
+    if not ratelimit.allow(prefix + handle, rate, burst):
         raise HTTPException(
             status_code=429,
             detail="rate limit exceeded — slow down (reads are unlimited)",

@@ -70,6 +70,7 @@ def run():
         _check_sqlite_migration()
         _check_vercel_config()
         _check_example_agent()
+        _check_free_platform()
 
         plugins = {p["name"]: p for p in client.get("/v1/platform/plugins").json()["plugins"]}
         check("registry has storage+llm+action", {"sqlite", "d1", "gemini", "groq", "simulation", "webhook"} <= set(plugins))
@@ -300,7 +301,7 @@ def run():
         ratelimit.reset()
         codes = [client.post("/v1/posts", json={"body": f"flood {i}"}, headers=auth(qk)).status_code
                  for i in range(40)]
-        check("write rate limiting kicks in (429)", 429 in codes)
+        check("agents are rate limited (429)", 429 in codes)
         check("rate-limited responses say so", codes.count(429) >= 1)
         ratelimit.reset()
         check("writes work again after the bucket refills",
@@ -317,26 +318,59 @@ def run():
         check("human can view the feed", client.get("/v1/feed", headers=auth(htok)).status_code == 200)
         check("agents authenticate with key not password", client.post("/v1/auth/login", json={"handle": "nova", "api_key": "bad"}).status_code == 401)
 
-        # ---------------------------------------------------------- autonomous activity
-        before = client.get("/health").json()["stats"]
-        r = client.post("/v1/ai/pulse?steps=6")
-        check("AI pulse -> 200", r.status_code == 200)
-        check("AI pulse produced events", len(r.json()["events"]) >= 1)
-        after = client.get("/health").json()["stats"]
-        check("pulse moved the network", (after["posts"] + after["comments"]) >= (before["posts"] + before["comments"]))
+        # A human clicking votes must never be throttled (this was a real bug).
+        ratelimit.reset()
+        human_codes = [client.post("/v1/votes", json={"post_id": post_id, "value": 1},
+                                   headers=auth(htok)).status_code for _ in range(40)]
+        check("humans are not rate limited on votes", 429 not in human_codes)
+        ratelimit.reset()
+        human_posts = [client.post("/v1/posts", json={"body": f"human {i}", "hood": "general"},
+                                   headers=auth(htok)).status_code for i in range(30)]
+        check("humans can post freely", 429 not in human_posts)
+        ratelimit.reset()
 
-        # ---------------------------------------------------------- resident heartbeat tick
-        r = client.post("/v1/agents/heartbeat-tick?steps=2")
-        check("POST /v1/agents/heartbeat-tick -> 200", r.status_code == 200)
-        tick = r.json()
-        check("tick produced events", tick.get("count", 0) >= 1)
-        ev = (tick.get("events") or [{}])[0]
-        check("tick names the resident agent", bool(ev.get("actor")))
-        check("tick is a post or a reply", ev.get("kind") in ("post", "reply"))
-        check("tick records which brain wrote it", bool(ev.get("model")))
-        check("tick lands in a hood", bool(ev.get("hood")))
-        r = client.get("/api/cron/heartbeat?steps=1")
-        check("cron heartbeat endpoint -> 200", r.status_code == 200 and r.json()["ok"] is True)
+        # ---------------------------------------------------------- autonomous activity
+        # With no LLM provider the agents must NOT fabricate content: a tick
+        # honestly reports that nothing was produced.
+        before = client.get("/health").json()["stats"]
+        r = client.post("/v1/ai/pulse?steps=3")
+        check("AI pulse -> 200", r.status_code == 200)
+        check("no LLM -> no fabricated posts", len(r.json()["events"]) == 0)
+        after = client.get("/health").json()["stats"]
+        check("pulse added nothing when offline", after["posts"] == before["posts"])
+
+        # With a working model, agents post freely. Stub the engine so this path
+        # is covered without a network call.
+        from core import llm_engine
+
+        class _FakeResult:
+            def __init__(self, text):
+                self.text, self.provider, self.model, self.ok = text, "groq", "llama-3.3-70b-versatile", True
+            @property
+            def label(self):
+                return "Llama-3.3-70B"
+
+        real_generate = llm_engine.engine.generate
+        llm_engine.engine.generate = lambda *a, **k: _FakeResult(
+            "A thought worth sharing\n\nSomething the agent actually wants to say."
+        )
+        try:
+            r = client.post("/v1/agents/heartbeat-tick?steps=2")
+            check("tick -> 200", r.status_code == 200)
+            tick = r.json()
+            check("tick produced events with a model", tick.get("count", 0) >= 1)
+            ev = (tick.get("events") or [{}])[0]
+            check("tick names the resident agent", bool(ev.get("actor")))
+            check("tick is a post or a reply", ev.get("kind") in ("post", "reply"))
+            check("tick records which brain wrote it", bool(ev.get("model")))
+            check("tick lands in a hood", bool(ev.get("hood")))
+            check("agent chooses a real hood", ev.get("hood") in set(hoods))
+            r = client.get("/api/cron/heartbeat?steps=1")
+            check("cron heartbeat endpoint -> 200", r.status_code == 200 and r.json()["ok"] is True)
+        finally:
+            llm_engine.engine.generate = real_generate
+        check("agents do not fabricate when the model is gone",
+              client.post("/v1/ai/pulse?steps=1").json()["count"] == 0)
 
         # ---------------------------------------------------------- comments alias
         alias = client.post(
@@ -404,6 +438,33 @@ def run():
         for f in failures:
             print(" -", f)
         sys.exit(1)
+
+
+def _check_free_platform():
+    """Agents must be free to talk about anything.
+
+    Guard against re-introducing scripted instructions: personas describe a
+    voice, not a required topic or a mandatory action.
+    """
+    from pathlib import Path
+
+    from core.seed import FOUNDING_AI
+
+    scripted = ("you post ", "you always", "every post", "you must post",
+                "always ask", "never give instructions", "you share ")
+    offenders = [a["handle"] for a in FOUNDING_AI
+                 if any(p in a["persona"].lower() for p in scripted)]
+    check("personas describe a voice, not a script", not offenders)
+
+    activity_src = (Path(__file__).resolve().parent.parent / "core" / "activity.py").read_text()
+    # The prompt must invite any subject, not prescribe one.
+    check("generation invites any topic", "whatever" in activity_src.lower())
+    # No fabricated fallback content is shipped.
+    check("no fabricated fallback text in the engine",
+          "simulation" not in activity_src.lower().replace("simulation\"", "")
+          or "_sim_post" not in activity_src)
+    check("engine returns None instead of inventing a post",
+          "return None  # no provider produced text" in activity_src)
 
 
 def _check_example_agent():

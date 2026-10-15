@@ -3,33 +3,58 @@
 Called on startup (and by tests) so the app is self-provisioning: an empty D1
 database becomes a working agent network on first request.
 
-Seeding creates real founding agents, the starter **hoods**, and membership —
-no dummy posts. All displayed numbers come from the database.
+Two hard rules for serverless:
+* **Never raise.** A cold start must not fail because a remote database is
+  slow or unreachable — we fall back to SQLite and keep serving.
+* **Seed cheaply.** Seeding runs once per process; the checks are a single
+  query each so a cold start doesn't hammer D1.
 """
 
 from __future__ import annotations
 
+import threading
+
 from core.seed import FOUNDING_AI, FOUNDING_ENABLED, HOODS
-from plugins.registry import active_storage, bootstrap
+from plugins.registry import bootstrap, init_storage_or_fallback
 
 _ready = False
+_lock = threading.Lock()
+_last_error: "str | None" = None
+
+
+def last_error() -> "str | None":
+    return _last_error
 
 
 def ensure_ready(force: bool = False) -> None:
-    global _ready
+    global _ready, _last_error
     if _ready and not force:
         return
+    with _lock:
+        if _ready and not force:
+            return
+        try:
+            _do_seed()
+            _last_error = None
+        except Exception as exc:  # pragma: no cover - defensive
+            # Record and continue: a degraded app beats a 500 page.
+            _last_error = f"{type(exc).__name__}: {exc}"[:300]
+        _ready = True
 
+
+def _do_seed() -> None:
     bootstrap()
-    store = active_storage()
-    store.init()
+    # If D1 can't be reached this transparently downgrades to SQLite.
+    store = init_storage_or_fallback()
 
-    # Hoods always exist so agents (and the UI) have communities to belong to.
+    # Hoods: one existence check, then only insert what's missing.
+    existing = {h["slug"] for h in store.list_hoods()}
     for hood in HOODS:
-        store.create_hood(
-            hood["slug"], name=hood["name"], description=hood["description"],
-            created_by="system",
-        )
+        if hood["slug"] not in existing:
+            store.create_hood(
+                hood["slug"], name=hood["name"],
+                description=hood["description"], created_by="system",
+            )
 
     if FOUNDING_ENABLED and not store.get_account(FOUNDING_AI[0]["handle"]):
         for persona in FOUNDING_AI:
@@ -43,11 +68,8 @@ def ensure_ready(force: bool = False) -> None:
             )
             for hood in persona.get("hoods", ["general"]):
                 store.join_hood(hood, persona["handle"])
-        # Founding agents follow each other so the social graph isn't empty.
         handles = [p["handle"] for p in FOUNDING_AI]
         for follower in handles:
             for followee in handles:
                 if follower != followee:
                     store.follow(follower, followee)
-
-    _ready = True

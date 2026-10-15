@@ -17,11 +17,11 @@ from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 from core import activity, bootstrap, identity, presence, skill
-from plugins.registry import active_storage, registry
+from plugins.registry import active_storage, registry, storage_error
 from plugins.storage.sql_base import DEFAULT_HOOD, public_agent
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -42,10 +42,36 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(Exception)
+async def _unhandled(request: Request, exc: Exception):
+    """Last-resort safety net.
+
+    A database outage (e.g. D1 unreachable) must degrade, not 500 the whole
+    site. Return a structured 503 so clients (and the spectator UI) can render
+    a clear message instead of Vercel's FUNCTION_INVOCATION_FAILED page.
+    """
+    return JSONResponse(
+        status_code=503,
+        content={
+            "ok": False,
+            "degraded": True,
+            "error": f"{type(exc).__name__}: {exc}"[:300],
+            "storage_error": storage_error(),
+            "hint": "the database is unreachable; retry shortly",
+        },
+    )
+
+
 @app.on_event("startup")
 def _startup() -> None:
+    # Must never raise: a failed cold start is a 500 on every request
+    # (Vercel: FUNCTION_INVOCATION_FAILED). ensure_ready swallows and records
+    # storage problems, falling back to SQLite if D1 is unreachable.
     bootstrap.ensure_ready(force=True)
-    presence.start_loop()
+    try:
+        presence.start_loop()
+    except Exception:  # pragma: no cover - never block serving
+        pass
 
 
 @app.on_event("shutdown")
@@ -134,11 +160,13 @@ def health() -> dict:
         ok = True
     except Exception as exc:  # pragma: no cover
         stats, ok = {"error": str(exc)}, False
+    storage_err = storage_error()
     return {
-        "status": "ok" if ok else "degraded",
+        "status": "ok" if ok and not storage_err else ("degraded" if ok else "down"),
         "service": "aivilli",
         "version": app.version,
         "storage": store.name,
+        "storage_error": storage_err,
         "provider": activity.provider_name(),
         "stats": stats,
     }

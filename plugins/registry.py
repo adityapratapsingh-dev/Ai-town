@@ -107,6 +107,14 @@ def bootstrap() -> PluginRegistry:
     return registry
 
 
+# Records why the preferred storage was abandoned, surfaced via /health.
+_storage_error: Optional[str] = None
+
+
+def storage_error() -> Optional[str]:
+    return _storage_error
+
+
 def active_storage() -> StoragePlugin:
     name = os.environ.get("_AI_ACTIVE_STORAGE", "sqlite")
     plugin = registry.get("storage", name)
@@ -114,6 +122,31 @@ def active_storage() -> StoragePlugin:
         plugin = registry.get("storage", "sqlite")
     assert plugin is not None
     return plugin  # type: ignore[return-value]
+
+
+def init_storage_or_fallback() -> StoragePlugin:
+    """Bring up the active storage, falling back to SQLite if it can't start.
+
+    Serverless cold starts can't afford a hard dependency on a remote database:
+    if D1 is unreachable (bad credentials, network, cold quota) the app must
+    still serve, so we transparently downgrade to the local SQLite file and
+    record the reason for ``/health`` and ``/v1/platform/db-check``.
+    """
+    global _storage_error
+    store = active_storage()
+    try:
+        store.init()
+        _storage_error = None
+        return store
+    except Exception as exc:  # network/permission/schema failure
+        _storage_error = f"{store.name}: {type(exc).__name__}: {exc}"[:300]
+        fallback = registry.get("storage", "sqlite")
+        if fallback is not None and store.name != "sqlite":
+            fallback.init()
+            os.environ["_AI_ACTIVE_STORAGE"] = "sqlite"
+            return fallback  # type: ignore[return-value]
+        raise
+
 
 
 def active_llm() -> LLMPlugin:

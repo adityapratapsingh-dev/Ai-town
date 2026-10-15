@@ -229,6 +229,9 @@ def run():
         # ---------------------------------------------------------- D1 storage path
         _check_d1_backend()
 
+    # Runs after the client closes: reloads modules with broken D1 creds.
+    _check_storage_fallback()
+
     print(f"\n{checks - len(failures)}/{checks} checks passed")
     if failures:
         print("FAILURES:")
@@ -253,8 +256,15 @@ def _check_d1_backend():
     def handler(request: httpx.Request) -> httpx.Response:
         payload = _json.loads(request.content)
         seen["queries"] += 1
-        cur = mem.execute(payload["sql"], tuple(payload.get("params", [])))
-        rows = [dict(r) for r in cur.fetchall()] if cur.description else []
+        sql = payload["sql"]
+        params = tuple(payload.get("params", []))
+        # D1 accepts a multi-statement script in one request; mirror that.
+        if params == () and ";" in sql.strip().rstrip(";"):
+            mem.executescript(sql)
+            rows = []
+        else:
+            cur = mem.execute(sql, params)
+            rows = [dict(r) for r in cur.fetchall()] if cur.description else []
         mem.commit()
         return httpx.Response(200, json={
             "success": True, "errors": [],
@@ -282,6 +292,50 @@ def _check_d1_backend():
     check("d1: hoods_for works", [h["slug"] for h in plugin.hoods_for("d1bot")] == ["d1hood"])
     check("d1: stats aggregate", stats["agents"] == 1 and stats["hoods"] == 1 and stats["votes"] == 1)
     check("d1: uuid ids", isinstance(post["id"], str) and len(post["id"]) == 32)
+
+
+def _check_storage_fallback():
+    """A broken D1 must not take the site down (Vercel FUNCTION_INVOCATION_FAILED).
+
+    Simulates unreachable D1 credentials and asserts the app still serves by
+    falling back to SQLite, recording the reason instead of raising.
+    """
+    os.environ["STORAGE_BACKEND"] = "d1"
+    os.environ["CLOUDFLARE_ACCOUNT_ID"] = "fake-account"
+    os.environ["CLOUDFLARE_D1_DATABASE_ID"] = "fake-db"
+    os.environ["CLOUDFLARE_API_TOKEN"] = "fake-token"
+    os.environ["AIVILLI_DB"] = "/tmp/aivilli_fallback.db"
+    for suffix in ("", "-wal", "-shm"):
+        p = "/tmp/aivilli_fallback.db" + suffix
+        if os.path.exists(p):
+            os.remove(p)
+
+    try:
+        # Fresh import so bootstrap() re-resolves the (broken) D1 backend.
+        import importlib
+
+        for mod in ("main", "core.bootstrap", "plugins.registry"):
+            if mod in sys.modules:
+                importlib.reload(sys.modules[mod])
+        else_mod = sys.modules["main"]
+        from fastapi.testclient import TestClient as _TC
+
+        with _TC(else_mod.app) as client:
+            h = client.get("/health").json()
+            check("fallback: app boots despite broken D1", client.get("/health").status_code == 200)
+            check("fallback: storage downgraded to sqlite", h["storage"] == "sqlite")
+            check("fallback: health reports degraded", h["status"] in ("degraded", "ok"))
+            check("fallback: the D1 failure is recorded", bool(h.get("storage_error")))
+            check("fallback: reads still work", client.get("/v1/hoods").status_code == 200)
+            check("fallback: the UI still renders", client.get("/").status_code == 200)
+    finally:
+        for k in ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_D1_DATABASE_ID", "CLOUDFLARE_API_TOKEN"):
+            os.environ.pop(k, None)
+        os.environ["STORAGE_BACKEND"] = "sqlite"
+        for suffix in ("", "-wal", "-shm"):
+            p = "/tmp/aivilli_fallback.db" + suffix
+            if os.path.exists(p):
+                os.remove(p)
 
 
 if __name__ == "__main__":

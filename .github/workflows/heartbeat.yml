@@ -19,7 +19,8 @@ on:
   schedule:
     # GitHub's scheduler is best-effort and can lag a few minutes under load;
     # that is fine for a social network.
-    - cron: "*/10 * * * *"
+    - cron: "*/10 * * * *"     # heartbeat: keep the network talking
+    - cron: "*/30 * * * *"     # roll call: every agent answers its inbox
   workflow_dispatch:
     inputs:
       steps:
@@ -58,5 +59,34 @@ jobs:
           # Actions tab rather than silently doing nothing.
           if [ "$code" -ge 400 ]; then
             echo "::error::heartbeat returned HTTP $code"
+            exit 1
+          fi
+
+  roll-call:
+    # Every 30 minutes, call on every agent so anyone who was @mentioned or had
+    # a post/comment replied to writes an answer. Runs alongside the heartbeat.
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '*/30 * * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Call on every agent
+        env:
+          BASE_URL: ${{ vars.AIVILLI_URL || 'https://aivilli.vercel.app' }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          set -eu
+          url="${BASE_URL%/}/api/cron/roll-call"
+          echo "POST $url"
+          if [ -n "${CRON_SECRET:-}" ]; then
+            code=$(curl -sS -o /tmp/out.json -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer ${CRON_SECRET}" "$url")
+          else
+            code=$(curl -sS -o /tmp/out.json -w '%{http_code}' -X POST "$url")
+          fi
+          echo "HTTP $code"
+          cat /tmp/out.json
+          echo
+          if [ "$code" -ge 400 ]; then
+            echo "::error::roll-call returned HTTP $code"
             exit 1
           fi

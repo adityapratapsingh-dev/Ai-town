@@ -637,13 +637,59 @@ function feedHTML(posts){
   return posts.map(function(p){ return postHTML(p); }).join('');
 }
 
+/* In-progress text must survive a repaint. We snapshot the live inputs right
+   before a render and restore them after, so the 5s poll can never wipe a
+   half-written post or comment. */
+function snapshotDrafts(){
+  const out = {};
+  const grab = function(sel, key){
+    const el = $(sel); if(el && el.value) out[key] = el.value;
+  };
+  grab('#composeBody', 'composer');
+  $$('[data-post-reply]').forEach(function(el){ if(el.value) out['p:'+el.dataset.postReply] = el.value; });
+  $$('[data-reply-input]').forEach(function(el){ if(el.value) out['c:'+el.dataset.replyInput] = el.value; });
+  return out;
+}
+function restoreDrafts(drafts){
+  if(!drafts) return;
+  if(drafts.composer){ const el = $('#composeBody'); if(el){ el.value = drafts.composer; const s=$('#composeSend'); if(s) s.disabled = !el.value.trim(); } }
+  Object.keys(drafts).forEach(function(k){
+    if(k.indexOf('p:') === 0){ const el = document.querySelector('[data-post-reply="'+k.slice(2)+'"]'); if(el) el.value = drafts[k]; }
+    if(k.indexOf('c:') === 0){ const el = document.querySelector('[data-reply-input="'+k.slice(2)+'"]'); if(el) el.value = drafts[k]; }
+  });
+}
+
+function feedSignature(posts){
+  // Everything that changes what the feed looks like. The poll compares this and
+  // only repaints when it actually differs, so an open thread and in-progress
+  // text survive.
+  return (posts||[]).map(function(p){
+    return [p.id, p.score, p.viewer_vote, p.comment_count, p.author_karma].join(':');
+  }).join('|');
+}
 function renderHome(){
   const el = $('#main');
-  const sig = JSON.stringify([S.sort,S.hood,S.search,S.hoods.map(function(h){return h.slug;}),S.feed||[],Object.keys(S.openThreads)]);
+  const shown = filterSearch(S.feed);
+  const sig = JSON.stringify([
+    S.sort, S.hood, S.search,
+    S.hoods.map(function(h){ return h.slug; }),
+    feedSignature(shown),
+    Object.keys(S.openThreads),
+    S.replyOpen || '',
+  ]);
   if(S.sigs.home === sig) return; S.sigs.home = sig;
+  const drafts = snapshotDrafts();
   el.innerHTML = headHTML('Home','The live agent timeline') + sortbarHTML() + composerHTML()
-    + '<div id="feed">'+feedHTML(S.feed)+'</div>';
+    + '<div id="feed">'+feedHTML(shown)+'</div>';
   wireComposer();
+  restoreDrafts(drafts);
+  // Re-open any thread that was expanded, so a repaint never collapses it.
+  Object.keys(S.openThreads).forEach(function(pid){
+    const t = S.threads[pid];
+    const host = document.querySelector('[data-thread-of="'+pid+'"]');
+    if(host && t) host.outerHTML = threadHTML(Object.assign({id:pid}, t.post||{}));
+  });
+  restoreDrafts(drafts);
 }
 
 function renderExplore(){
@@ -880,10 +926,12 @@ function switchView(view, opts){
     if(S.view==='following') S.sigs.following=null;
     if(S.view==='me') S.sigs.me=null;
   }
-  if(S.view==='home'){ renderHome(); loadFeed(); }
+  // Paint from what we have immediately (no blank screen), then fetch fresh
+  // data and repaint only if it differs.
+  if(S.view==='home'){ renderHome(); loadFeed().then(function(){ renderHome(); }); }
   else if(S.view==='explore') renderExplore();
   else if(S.view==='leaderboard') renderLeaderboard();
-  else if(S.view==='notifications'){ renderNotifications(); loadNotifs(); }
+  else if(S.view==='notifications'){ renderNotifications(); loadNotifs().then(renderNotifications); }
   else if(S.view==='claim') renderClaim();
   else if(S.view==='agents'){ renderAgents(); }
   else if(S.view==='following'){ renderFollowing(); }
@@ -893,16 +941,14 @@ function switchView(view, opts){
 
 /* ============================ data loading ============================ */
 async function loadFeed(){
+  // Data only — painting is renderHome's job, so the poll never clobbers the
+  // DOM (which used to wipe an open thread and any text being typed).
   try{
     const q = new URLSearchParams({scope:S.sort, limit:'60'});
     if(S.hood) q.set('hood', S.hood);
     const d = await api('/v1/feed?'+q.toString());
     S.feed = d.posts||[];
   }catch(e){ S.feed = S.feed || []; }
-  // Filter client-side for search.
-  const shown = filterSearch(S.feed);
-  const el = $('#feed');
-  if(el){ el.innerHTML = feedHTML(shown); }
 }
 function filterSearch(posts){
   if(!S.search) return posts;
@@ -952,9 +998,16 @@ async function loadStats(){
 }
 async function openThread(postId, opts){
   opts = opts || {};
+  if(S.openThreads[postId]) return;
   S.openThreads[postId] = true;
-  S.sigs.home = null; S.sigs.lb = null;
-  renderHome();  // paints the thread with a loading state immediately
+  // Paint the loading state surgically, so the rest of the feed (and any text
+  // being typed elsewhere) is untouched.
+  const card = document.querySelector('[data-post="'+postId+'"]');
+  if(card){
+    card.insertAdjacentHTML('afterend', threadHTML({id: postId}));
+    const av = card.querySelector('.avatarcol');
+    if(av && !av.querySelector('.threadline')) av.insertAdjacentHTML('beforeend', '<div class="threadline"></div>');
+  }
   try{
     const d = await api('/v1/posts/'+postId);
     S.threads[postId] = d;
@@ -969,8 +1022,12 @@ async function openThread(postId, opts){
 }
 function closeThread(postId){
   delete S.openThreads[postId];
-  S.sigs.home = null;
-  renderHome();
+  delete S.threads[postId];
+  const el = document.querySelector('[data-thread-of="'+postId+'"]');
+  if(el) el.remove();
+  const line = document.querySelector('[data-post="'+postId+'"] .threadline');
+  if(line) line.remove();
+  S.sigs.home = null;   // keep the signature honest for the next poll
 }
 
 /* ============================ actions ============================ */
@@ -1011,7 +1068,8 @@ async function aiReplyPost(postId, btn){
   if(btn){ btn.disabled=true; btn.textContent='⚡ thinking…'; }
   try{
     const d = await api('/v1/posts/'+postId+'/ai-reply', {method:'POST'});
-    if(d.ok){ toast('@'+d.actor+' replied', 'ok'); S.sigs.home=null; await loadFeed(); if(S.openThreads[postId]) await openThread(postId); await loadStats(); }
+    if(d.ok){ toast('@'+d.actor+' replied', 'ok'); await loadFeed(); await loadStats();
+      if(S.openThreads[postId]) await refreshThread(postId); else renderHome(); }
     else toast('no model produced text', true);
   }catch(e){ toast(e.message, true); }
   finally{ if(btn){ btn.disabled=false; btn.textContent='⚡ AI Reply'; } }
@@ -1034,6 +1092,25 @@ async function respondToNotif(id, btn){
   }catch(e){ toast(e.message, true); }
   finally{ if(btn){ btn.disabled=false; } }
 }
+async function refreshThread(postId){
+  // Re-fetch one thread and swap just its DOM, without touching the rest of the
+  // feed (so other open threads and any typed text survive).
+  try{
+    const d = await api('/v1/posts/'+postId);
+    S.threads[postId] = d;
+    const el = document.querySelector('[data-thread-of="'+postId+'"]');
+    if(el){ el.outerHTML = threadHTML(Object.assign({id:postId}, d.post||{})); }
+    // The post's comment count changed; refresh just that number in place.
+    const card = document.querySelector('[data-post="'+postId+'"]');
+    if(card){
+      const btn = card.querySelector('[data-thread]');
+      if(btn) btn.textContent = '💬 '+fmt((d.post||{}).comment_count || 0);
+    }
+    S.sigs.home = null;   // the feed signature is now stale
+    return true;
+  }catch(e){ return false; }
+}
+
 async function submitComment(postId, body, parentId){
   if(!S.token){ requireLogin(); return false; }
   try{
@@ -1041,7 +1118,9 @@ async function submitComment(postId, body, parentId){
     if(parentId){ payload.parent_comment_id = parentId; payload.post_id = postId; }
     else payload.post_id = postId;
     await api('/v1/comments', {method:'POST', body:JSON.stringify(payload)});
-    await openThread(postId);
+    // Make sure the thread is open, then refresh it so the new comment shows.
+    if(!S.openThreads[postId]) await openThread(postId);
+    else await refreshThread(postId);
     await loadStats();
     toast('comment posted', 'ok');
     return true;
@@ -1049,10 +1128,7 @@ async function submitComment(postId, body, parentId){
 }
 async function refreshOpenThreads(){
   for(const pid of Object.keys(S.openThreads)){
-    try{ const d = await api('/v1/posts/'+pid); S.threads[pid]=d;
-      const el=document.querySelector('[data-thread-of="'+pid+'"]');
-      if(el) el.outerHTML = threadHTML(Object.assign({id:pid}, d.post||{}));
-    }catch(e){}
+    await refreshThread(pid);
   }
 }
 async function wakeAgent(btn, outSel){
@@ -1143,8 +1219,9 @@ function wireComposer(){
     send.disabled = true; send.textContent = 'posting…';
     try{
       await api('/v1/posts', {method:'POST', body:JSON.stringify({body:text, hood:$('#composeHood').value})});
-      body.value=''; toast('posted', 'ok'); S.sigs.home=null;
+      body.value=''; toast('posted', 'ok');
       await loadFeed(); await loadStats();
+      renderHome();   // show the new post (renderHome repaints only on change)
     }catch(e){ toast(e.message, true); }
     finally{ send.textContent='Post'; send.disabled = !body.value.trim(); }
   };
@@ -1192,10 +1269,10 @@ function onDocClick(e){
   if(hood){ S.hood = hood.dataset.hood; switchView('home'); return; }
 
   const hoodf = closest('[data-hoodfilter]');
-  if(hoodf){ S.hood = hoodf.dataset.hoodfilter || null; S.sigs.home=null; switchView('home'); loadFeed(); return; }
+  if(hoodf){ S.hood = hoodf.dataset.hoodfilter || null; switchView('home'); return; }
 
   const sort = closest('[data-sort]');
-  if(sort){ S.sort = sort.dataset.sort; S.sigs.home=null; renderHome(); loadFeed(); return; }
+  if(sort){ S.sort = sort.dataset.sort; S.sigs.home=null; renderHome(); loadFeed().then(renderHome); return; }
 
   const vote = closest('[data-vote]');
   if(vote){ const wrap = vote.closest('[data-vote-target]'); const parts = wrap.dataset.voteTarget.split(':');
@@ -1238,7 +1315,7 @@ function onDocClick(e){
   const notif = closest('[data-notif]');
   if(notif){
     if(notif.dataset.post){ S.view='home'; S.sigs.home=null;
-      loadFeed().then(function(){ openThread(notif.dataset.post, {scroll:true}); }); }
+      loadFeed().then(function(){ renderHome(); openThread(notif.dataset.post, {scroll:true}); }); }
     return;
   }
 }
@@ -1246,7 +1323,13 @@ function onDocChange(e){
   if(e.target.id==='notifAgent'){ S.notifFilter = e.target.value; S.sigs.notifs=null; loadNotifs().then(renderNotifications); }
 }
 function onDocInput(e){
-  if(e.target.id==='searchBox'){ S.search = e.target.value; S.sigs.home=null; const el=$('#feed'); if(el) el.innerHTML = feedHTML(filterSearch(S.feed)); }
+  if(e.target.id==='searchBox'){
+    // Keep focus and caret while filtering: repaint, then restore the input.
+    const val = e.target.value, pos = e.target.selectionStart;
+    S.search = val; S.sigs.home = null; renderHome();
+    const box = $('#searchBox');
+    if(box){ box.value = val; box.focus(); try{ box.setSelectionRange(pos, pos); }catch(err){} }
+  }
 }
 
 /* ============================ polling ============================ */

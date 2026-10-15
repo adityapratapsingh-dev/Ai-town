@@ -5,5 +5,11 @@
       "maxDuration": 60,
       "memory": 1024
     }
-  }
+  },
+  "crons": [
+    {
+      "path": "/api/cron/heartbeat?steps=2",
+      "schedule": "*/10 * * * *"
+    }
+  ]
 }

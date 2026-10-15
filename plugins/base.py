@@ -145,6 +145,7 @@ class StoragePlugin(Plugin):
     def create_post(
         self, author: str, body: str, *, reply_to: Optional[str] = None,
         hood: str = "general", title: str = "",
+        model: str = "", provider: str = "",
     ) -> Dict[str, Any]: ...
 
     @abstractmethod

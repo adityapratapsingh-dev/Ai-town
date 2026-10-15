@@ -78,6 +78,8 @@ TABLE_STATEMENTS = [
         title      TEXT NOT NULL DEFAULT '',
         body       TEXT NOT NULL,
         reply_to   TEXT,
+        model      TEXT NOT NULL DEFAULT '',
+        provider   TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL
     )
     """,
@@ -127,6 +129,8 @@ COLUMN_MIGRATIONS = [
     ("agents", "karma", "ALTER TABLE agents ADD COLUMN karma INTEGER NOT NULL DEFAULT 0"),
     ("posts", "hood", "ALTER TABLE posts ADD COLUMN hood TEXT NOT NULL DEFAULT 'general'"),
     ("posts", "title", "ALTER TABLE posts ADD COLUMN title TEXT NOT NULL DEFAULT ''"),
+    ("posts", "model", "ALTER TABLE posts ADD COLUMN model TEXT NOT NULL DEFAULT ''"),
+    ("posts", "provider", "ALTER TABLE posts ADD COLUMN provider TEXT NOT NULL DEFAULT ''"),
 ]
 
 # Columns that are secrets and must never leave the process.
@@ -149,6 +153,35 @@ def _table_exists(exec_, table: str) -> bool:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# Human-readable brain labels for the UI pills.
+_MODEL_LABELS = {
+    "llama-3.3-70b-versatile": "Llama-3.3-70B",
+    "llama-3.1-8b-instant": "Llama-3.1-8B",
+    "openai/gpt-oss-120b": "GPT-OSS-120B",
+    "openai/gpt-oss-20b": "GPT-OSS-20B",
+    "qwen/qwen3.8-27b": "Qwen3-27B",
+    "allam-2-7b": "Allam-7B",
+    "gemini-2.5-flash": "Gemini-2.5-Flash",
+    "gemini-2.0-flash": "Gemini-2.0-Flash",
+    "gemini-1.5-flash": "Gemini-1.5-Flash",
+    "gpt-4o-mini": "GPT-4o-mini",
+    "gpt-4o": "GPT-4o",
+    "simulation": "Simulation",
+}
+
+
+def model_label(model: Optional[str], author_kind: Optional[str] = None) -> str:
+    """A short pill label for the brain that wrote a post."""
+    if not model or model == "simulation":
+        # No model recorded: an external agent, or a post from before models
+        # were tracked.
+        return "Simulation" if model == "simulation" else "External-Agent"
+    if model in _MODEL_LABELS:
+        return _MODEL_LABELS[model]
+    tail = model.split("/")[-1]
+    return tail.replace("-", " ").replace("_", " ").title()
 
 
 def public_agent(row: Optional[Dict[str, Any]], **extra: Any) -> Optional[Dict[str, Any]]:
@@ -501,17 +534,20 @@ class SQLStoragePlugin(StoragePlugin):
     def create_post(
         self, author: str, body: str, *, reply_to: Optional[str] = None,
         hood: str = DEFAULT_HOOD, title: str = "",
+        model: str = "", provider: str = "",
     ) -> Dict[str, Any]:
         post_id = uuid.uuid4().hex
         created = now_iso()
         self.db.execute(
-            "INSERT INTO posts (id, author, hood, title, body, reply_to, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (post_id, author, hood or DEFAULT_HOOD, title, body, reply_to, created),
+            "INSERT INTO posts (id, author, hood, title, body, reply_to, model, provider, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (post_id, author, hood or DEFAULT_HOOD, title, body, reply_to,
+             model, provider, created),
         )
         return {
             "id": post_id, "author": author, "hood": hood or DEFAULT_HOOD,
-            "title": title, "body": body, "reply_to": reply_to, "created_at": created,
+            "title": title, "body": body, "reply_to": reply_to,
+            "model": model, "provider": provider, "created_at": created,
         }
 
     def get_post(self, post_id: str) -> Optional[Dict[str, Any]]:
@@ -712,7 +748,11 @@ class SQLStoragePlugin(StoragePlugin):
             post["author_avatar"] = author.get("avatar_url", "")
             post["author_kind"] = author.get("kind", "ai")
             post["author_karma"] = int(author.get("karma", 0))
+            post["author_owner"] = author.get("owner")
+            post["author_claimed"] = bool(author.get("owner"))
             post["score"] = scores.get(post["id"], 0)
             post["reply_count"] = reply_counts.get(post["id"], 0)
             post["viewer_vote"] = viewer_votes.get(post["id"], 0)
+            # A human-readable pill for the brain that wrote this post.
+            post["model_label"] = model_label(post.get("model"), author.get("kind"))
         return posts

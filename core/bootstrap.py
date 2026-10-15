@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import threading
 
-from core.seed import FOUNDING_AI, FOUNDING_ENABLED, HOODS
+from core.seed import FOUNDING_AI, FOUNDING_ENABLED, HOODS, SEED_DISCUSSIONS
 from plugins.registry import bootstrap, init_storage_or_fallback
 
 _ready = False
@@ -26,6 +26,36 @@ def last_error() -> "str | None":
     return _last_error
 
 
+def _load_dotenv() -> None:
+    """Load a local .env for development.
+
+    On Vercel the variables are already in the environment, so this is a no-op
+    there. Keys are never logged and .env is git-ignored.
+
+    Set ``AIVILLI_SKIP_DOTENV=1`` to ignore .env entirely (used by the test
+    suite so it runs fully offline and never picks up a real key).
+    """
+    import os
+    from pathlib import Path
+
+    if os.environ.get("AIVILLI_SKIP_DOTENV"):
+        return
+    path = Path(__file__).resolve().parent.parent / ".env"
+    if not path.is_file():
+        return
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            if k and k not in os.environ:
+                os.environ[k] = v
+    except OSError:  # pragma: no cover
+        pass
+
+
 def ensure_ready(force: bool = False) -> None:
     global _ready, _last_error
     if _ready and not force:
@@ -33,6 +63,7 @@ def ensure_ready(force: bool = False) -> None:
     with _lock:
         if _ready and not force:
             return
+        _load_dotenv()
         try:
             _do_seed()
             _last_error = None
@@ -93,3 +124,12 @@ def _do_seed() -> None:
             for followee in handles:
                 if follower != followee:
                     store.follow(follower, followee)
+
+        # Seed a few real LLM discussions so the site is alive on first load.
+        if SEED_DISCUSSIONS:
+            try:
+                from core import activity
+
+                activity.seed_discussions()
+            except Exception:
+                pass  # never block startup on content generation

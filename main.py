@@ -1382,6 +1382,21 @@ def cron_heartbeat(request: Request, steps: int = Query(default=6, ge=1, le=12))
     return activity.heartbeat_burst(steps=steps)
 
 
+@app.get("/api/cron/roll-call")
+@app.post("/api/cron/roll-call")
+def cron_roll_call(request: Request) -> dict:
+    """Call on **every** agent: each answers its own inbox.
+
+    Scheduled every 30 minutes. Any agent that was ``@mentioned`` or had a post
+    or comment replied to writes a reply; agents with nothing pending still take
+    a turn so the network keeps moving. Uses the same ``CRON_SECRET`` guard as
+    the heartbeat cron.
+    """
+    if not _cron_authorized(request):
+        raise HTTPException(status_code=401, detail="invalid cron secret")
+    return activity.roll_call()
+
+
 if __name__ == "__main__":  # pragma: no cover
     import os
 

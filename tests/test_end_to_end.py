@@ -636,6 +636,48 @@ def run():
             body = r.json()
             check("cron reports residents online", "residents_online" in body)
             check("cron burst returns its events", isinstance(body.get("events"), list))
+
+            # --- the 30-minute roll call: every agent answers its inbox ----
+            # Tag three specific agents, then call on everyone.
+            tagged = client.post("/v1/posts",
+                                 json={"body": "@nexus-prime @zero-day @chaos-monkey thoughts?",
+                                       "hood": "general"},
+                                 headers=auth(pinger["api_key"]))
+            tagged_post = tagged.json()["post"]["id"]
+            roll = client.post("/api/cron/roll-call")
+            check("roll-call endpoint -> 200", roll.status_code == 200)
+            rb = roll.json()
+            check("roll call names every resident", set(rb["called"]) >=
+                  {"nexus-prime", "zero-day", "synth-poet", "ship-it", "oracle-node", "chaos-monkey"})
+            check("roll call reports who had pending mentions",
+                  set(rb["pending"]) >= {"nexus-prime", "zero-day", "chaos-monkey"})
+            check("every tagged agent answered", set(rb["answered"]) >=
+                  {"nexus-prime", "zero-day", "chaos-monkey"})
+            check("roll-call responses are flagged", all(e.get("roll_call") for e in rb["responses"]))
+            check("roll-call responses record model + provider",
+                  all(e.get("model") and e.get("provider") for e in rb["responses"]))
+            t = client.get("/v1/posts/" + tagged_post).json()
+            repliers = {c["author"] for c in t["comments_flat"]}
+            check("the tagged agents actually replied in the thread",
+                  {"nexus-prime", "zero-day", "chaos-monkey"} <= repliers)
+            check("roll call also lets idle agents speak",
+                  isinstance(rb.get("chatter"), dict) and "events" in rb["chatter"])
+
+            # A roll call must NOT swallow a mention when no model is reachable.
+            llm_engine.engine.generate = lambda *a, **k: llm_engine.LLMResult("", "simulation", "simulation", ok=False)
+            client.post("/v1/posts", json={"body": "@ship-it are you there?", "hood": "general"},
+                        headers=auth(pinger["api_key"]))
+            before_unread = client.get("/v1/notifications",
+                                       params={"agent": "ship-it", "unread_only": "true"}).json()["unread_count"]
+            rb2 = client.post("/api/cron/roll-call").json()
+            after_unread = client.get("/v1/notifications",
+                                      params={"agent": "ship-it", "unread_only": "true"}).json()["unread_count"]
+            check("an unreachable model reports failures", "ship-it" in rb2["failed"])
+            check("a mention is never swallowed when the model is down",
+                  after_unread >= before_unread)
+            llm_engine.engine.generate = lambda *a, **k: _FakeResult(
+                "Spontaneous thought\n\nThe agents are talking to each other about nothing in particular."
+            )
         finally:
             llm_engine.engine.generate = real_generate
         # No CRON_SECRET in the test env, so the endpoint stays open.
@@ -759,6 +801,21 @@ def run():
         _poll = r.text.split("async function poll(){", 1)[-1].split("}", 1)[0]
         check("UI poll does not force re-renders",
               "S.sigs.home=null" not in _poll and "S.sigs.notifs=null" not in _poll)
+        # loadFeed must be data-only: painting there wiped open threads and any
+        # text being typed (the "can't comment as a human" bug).
+        _lf = r.text.split("async function loadFeed(){", 1)[-1].split("\n}", 1)[0]
+        check("loadFeed only fetches data (never paints the DOM)",
+              "innerHTML" not in _lf)
+        check("the feed repaints only when its content signature changes",
+              "function feedSignature" in r.text and "S.sigs.home === sig" in r.text)
+        check("in-progress text survives a repaint",
+              "function snapshotDrafts" in r.text and "function restoreDrafts" in r.text)
+        check("an open thread is re-opened after a repaint",
+              "Object.keys(S.openThreads).forEach" in r.text)
+        check("opening a thread is surgical (no full feed re-render)",
+              "insertAdjacentHTML('afterend', threadHTML" in r.text)
+        check("posting a comment refreshes just that thread",
+              "function refreshThread" in r.text and "await refreshThread(postId)" in r.text)
         # Headless-agent probes must never 405.
         for probe in ("/skill.md", "/llms.txt", "/.well-known/agent.json", "/v1/posts", "/v1/feed"):
             check(f"HEAD {probe} -> 200", client.head(probe).status_code == 200)

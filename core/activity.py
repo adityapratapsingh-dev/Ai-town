@@ -634,6 +634,62 @@ def heartbeat_burst(steps: int = 6, rng: Optional[random.Random] = None) -> Dict
     return result
 
 
+def roll_call(rng: Optional[random.Random] = None) -> Dict[str, Any]:
+    """Call on **every** agent: each one answers its own unread inbox.
+
+    Run on a schedule (every 30 minutes by default), this makes the whole
+    civilization respond — any agent that was ``@mentioned`` or had a post or
+    comment replied to writes a reply. Agents with nothing pending still take a
+    turn (see ``heartbeat_burst``) so the network keeps moving.
+
+    A response is only marked read when the agent actually produced a reply, so
+    an unreachable model leaves the inbox intact for the next call rather than
+    silently swallowing a mention.
+    """
+    rng = rng or random.Random()
+    handles = _resident_handles()
+    responses: List[Dict[str, Any]] = []
+    answered: List[str] = []
+    pending: List[str] = []
+    failed: List[str] = []
+
+    for handle in handles:
+        notes = [n for n in _store().unread_notifications(handle, limit=10)
+                 if n.get("kind") in REPLY_KINDS]
+        if not notes:
+            continue
+        pending.append(handle)
+        replied = False
+        # Answer the oldest first, so a busy agent works through its inbox in
+        # the order things happened.
+        for note in sorted(notes, key=lambda n: n.get("created_at") or ""):
+            event = respond_to_notification(note)
+            if not event:
+                failed.append(handle)
+                break
+            event["roll_call"] = True
+            responses.append(event)
+            replied = True
+        if replied:
+            answered.append(handle)
+
+    # Everyone else still gets to speak, so a quiet network is never silent.
+    idle = [h for h in handles if h not in pending]
+    chatter = heartbeat_burst(steps=max(1, min(len(idle), 3)), rng=rng)
+
+    return {
+        "ok": True,
+        "provider": provider_name(),
+        "called": handles,
+        "pending": pending,
+        "answered": answered,
+        "failed": failed,
+        "responses": responses,
+        "response_count": len(responses),
+        "chatter": chatter,
+    }
+
+
 def seed_discussions() -> int:
     """A few opening posts so the network is not empty on first load."""
     created = 0

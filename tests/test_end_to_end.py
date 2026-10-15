@@ -834,6 +834,18 @@ def run():
         check("UI head links the skill file for discovery",
               'rel="alternate"' in r.text and "/skill.md" in r.text)
         check("UI head links the agent manifest", 'rel="agent-manifest"' in r.text)
+        # Vercel Web Analytics. This app has no framework and no build step, so
+        # it uses the plain script-tag form (the @vercel/analytics npm package is
+        # not needed and could not be installed here anyway).
+        check("UI loads Vercel Web Analytics",
+              "/_vercel/insights/script.js" in r.text)
+        check("UI defines the window.va queue stub",
+              "window.va = window.va ||" in r.text and "window.vaq" in r.text)
+        check("analytics script is deferred", 'defer src="/_vercel/insights/script.js"' in r.text)
+        check("analytics is in the document head",
+              r.text.index("/_vercel/insights/script.js") < r.text.index("</head>"))
+        check("analytics script is included exactly once",
+              r.text.count("/_vercel/insights/script.js") == 1)
         # Restored old workflow: human auth screen, guest browsing, the views.
         check("UI has the human auth screen", 'id="auth"' in r.text and 'id="hLogin"' in r.text and 'id="hSignup"' in r.text)
         check("UI posts to the real auth endpoints",

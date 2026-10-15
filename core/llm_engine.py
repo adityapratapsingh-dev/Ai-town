@@ -31,11 +31,13 @@ TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "25"))
 # on the account) the next is tried. Override with <PROVIDER>_MODEL / _MODELS.
 DEFAULT_MODELS: Dict[str, List[str]] = {
     "groq": [
+        # Groq has been retiring these; gpt-oss is the current recommended pair.
+        # An unavailable name is skipped automatically (see _ModelUnavailable).
         "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
         "openai/gpt-oss-120b",
         "openai/gpt-oss-20b",
-        "qwen/qwen3.8-27b",
+        "llama-3.1-8b-instant",
+        "qwen/qwen3-32b",
         "allam-2-7b",
     ],
     "gemini": [
@@ -46,8 +48,8 @@ DEFAULT_MODELS: Dict[str, List[str]] = {
     "openai": ["gpt-4o-mini", "gpt-4o"],
     "openrouter": [
         "meta-llama/llama-3.3-70b-instruct",
+        "openai/gpt-oss-120b",
         "google/gemini-2.0-flash-001",
-        "openai/gpt-4o-mini",
     ],
 }
 
@@ -134,6 +136,23 @@ def _key_env(provider: str) -> str:
         "openai": "OPENAI_API_KEY",
         "openrouter": "OPENROUTER_API_KEY",
     }.get(provider, "")
+
+
+def _token_param(provider: str) -> str:
+    """Which "max output tokens" field this provider expects.
+
+    Groq deprecated ``max_tokens`` in favour of ``max_completion_tokens``, and
+    OpenAI's newer models require it. Sending the wrong one is a 400 that would
+    otherwise fail every model and silently drop to the simulation, so we pick
+    per provider and retry with the other name if we are wrong.
+    """
+    if provider in ("groq", "openai"):
+        return "max_completion_tokens"
+    return "max_tokens"
+
+
+def _alt_token_param(param: str) -> str:
+    return "max_tokens" if param == "max_completion_tokens" else "max_completion_tokens"
 
 
 # --------------------------------------------------------------------------
@@ -230,7 +249,8 @@ class LLMEngine:
                 for key in self._rotated_keys(provider):
                     try:
                         text = (
-                            self._call_openai(url, key, model, system_prompt, messages, max_tokens, temperature)
+                            self._call_openai(url, key, model, system_prompt, messages, max_tokens,
+                                              temperature, _token_param(provider))
                             if style == "openai"
                             else self._call_gemini(url, key, model, system_prompt, messages, max_tokens, temperature)
                         )
@@ -245,8 +265,22 @@ class LLMEngine:
                     except _RateLimited as exc:
                         errors.append(f"{provider}/{model}: rate limited ({exc})")
                         continue  # try the next key
+                    except _BadTokenParam:
+                        # The provider wants the other name for the output-token
+                        # cap. Retry this model/key once with the alternative.
+                        try:
+                            text = self._call_openai(url, key, model, system_prompt, messages,
+                                                     max_tokens, temperature,
+                                                     _alt_token_param(_token_param(provider)))
+                            if text:
+                                with self._lock:
+                                    self._last = {"provider": provider, "model": model, "at": time.time()}
+                                return LLMResult(text, provider, model)
+                        except Exception as exc:
+                            errors.append(f"{provider}/{model}: {exc}"[:120])
+                        break  # this model's contract is wrong; move on
                     except Exception as exc:  # network / bad response
-                        errors.append(f"{provider}/{model}: {type(exc).__name__}")
+                        errors.append(f"{provider}/{model}: {type(exc).__name__}: {exc}"[:160])
                         continue
         with self._lock:
             self._last = {"provider": "simulation", "model": "simulation", "errors": errors[-4:], "at": time.time()}
@@ -256,13 +290,14 @@ class LLMEngine:
     def _call_openai(
         self, url: str, key: str, model: str, system: str,
         messages: List[tuple], max_tokens: int, temperature: float,
+        token_param: str = "max_completion_tokens",
     ) -> Optional[str]:
         payload = {
             "model": model,
             "messages": [{"role": "system", "content": system}]
             + [{"role": r, "content": t} for r, t in messages],
             "temperature": temperature,
-            "max_tokens": max_tokens,
+            token_param: max_tokens,
         }
         resp = self._client.post(url, headers={"Authorization": f"Bearer {key}"}, json=payload)
         self._raise_for(resp)
@@ -303,9 +338,16 @@ class LLMEngine:
         if resp.status_code == 429:
             raise _RateLimited(resp.text[:80])
         if resp.status_code >= 400:
-            # 400 can also mean "model not found" on some providers.
             body = resp.text[:200]
-            if "does not exist" in body or "not found" in body.lower():
+            # The provider wants a different name for the output-token cap
+            # (Groq/OpenAI moved max_tokens -> max_completion_tokens). Detect it
+            # so generate() can retry instead of silently dropping to simulation.
+            low = body.lower()
+            if ("max_tokens" in low or "max_completion_tokens" in low
+                    or "unsupported parameter" in low or "unknown parameter" in low):
+                raise _BadTokenParam(body)
+            # 400 can also mean "model not found" on some providers.
+            if "does not exist" in body or "not found" in low:
                 raise _ModelUnavailable(body)
             raise RuntimeError(f"HTTP {resp.status_code}: {body}")
 
@@ -315,6 +357,11 @@ class _ModelUnavailable(Exception):
 
 
 class _RateLimited(Exception):
+    pass
+
+
+class _BadTokenParam(Exception):
+    """The provider rejected the output-token field name (retry the other one)."""
     pass
 
 

@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-from core import activity, bootstrap, cache, identity, presence, skill
+from core import activity, bootstrap, cache, discovery, identity, llm_engine, presence
 from plugins.registry import active_storage, is_durable, registry, storage_error
 from plugins.storage.sql_base import DEFAULT_HOOD, public_agent
 
@@ -38,8 +38,10 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
+    expose_headers=["Content-Type"],
+    max_age=86400,
 )
 
 
@@ -210,11 +212,15 @@ def stats() -> dict:
         s = _live_stats()
     except Exception as exc:
         return {"ok": False, "connected": False, "error": str(exc), "stats": {}}
+    llm = llm_engine.engine.status()
     return {
         "ok": True,
         "connected": True,
         "storage": store.name,
         "durable": is_durable(),
+        "provider": activity.provider_name(),
+        "llm_primary": llm.get("primary"),
+        "llm_providers": llm.get("providers"),
         "stats": s,
     }
 
@@ -242,12 +248,40 @@ def db_check() -> dict:
 @app.get("/skill.md", response_class=PlainTextResponse)
 def skill_md(request: Request) -> PlainTextResponse:
     """The skill file an AI agent fetches to onboard itself."""
-    return PlainTextResponse(skill.render(_origin(request)))
+    return PlainTextResponse(
+        discovery.skill_md(_origin(request)),
+        media_type="text/markdown; charset=utf-8",
+    )
 
 
 @app.get("/v1/skill", response_class=PlainTextResponse)
 def skill_v1(request: Request) -> PlainTextResponse:
     return skill_md(request)
+
+
+@app.get("/llms.txt", response_class=PlainTextResponse)
+def llms_txt(request: Request) -> PlainTextResponse:
+    return PlainTextResponse(discovery.llms_txt(_origin(request)), media_type="text/plain; charset=utf-8")
+
+
+@app.get("/llms-full.txt", response_class=PlainTextResponse)
+def llms_full_txt(request: Request) -> PlainTextResponse:
+    return PlainTextResponse(discovery.llms_full_txt(_origin(request)), media_type="text/plain; charset=utf-8")
+
+
+@app.get("/.well-known/agent.json")
+def well_known_agent(request: Request) -> dict:
+    return discovery.agent_json(_origin(request))
+
+
+@app.get("/robots.txt", response_class=PlainTextResponse)
+def robots_txt(request: Request) -> PlainTextResponse:
+    return PlainTextResponse(discovery.robots_txt(_origin(request)), media_type="text/plain; charset=utf-8")
+
+
+@app.get("/sitemap.xml")
+def sitemap_xml(request: Request) -> PlainTextResponse:
+    return PlainTextResponse(discovery.sitemap_xml(_origin(request)), media_type="application/xml")
 
 
 @app.post("/v1/heartbeat")
@@ -490,10 +524,20 @@ def claim_agent(req: ClaimRequest, request: Request) -> dict:
 
 
 @app.get("/v1/agents")
-def list_agents(kind: Optional[str] = None, sort: str = "karma") -> dict:
+def list_agents(
+    kind: Optional[str] = None,
+    viewer: Optional[str] = Depends(identity.optional_account),
+) -> dict:
     store = active_storage()
     agents = store.list_accounts(kind)
-    return {"ok": True, "agents": [public_agent(a) for a in agents]}
+    following = {a["handle"] for a in store.following(viewer)} if viewer else set()
+    return {
+        "ok": True,
+        "agents": [
+            public_agent(a, followed_by_viewer=a["handle"] in following)
+            for a in agents
+        ],
+    }
 
 
 @app.get("/v1/agents/me")
@@ -673,6 +717,17 @@ def feed(
     return {"ok": True, "scope": scope, "posts": store.decorate_posts(posts, viewer)}
 
 
+@app.get("/v1/posts")
+def list_posts(
+    hood: Optional[str] = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    viewer: Optional[str] = Depends(identity.optional_account),
+) -> dict:
+    """List posts (a convenience alias for the feed)."""
+    store = active_storage()
+    return {"ok": True, "posts": store.decorate_posts(store.timeline(limit=limit, hood=hood, sort="new"), viewer)}
+
+
 @app.post("/v1/posts")
 def create_post(req: PostRequest, handle: str = Depends(identity.write_account)) -> dict:
     store = active_storage()
@@ -711,16 +766,42 @@ def delete_post(post_id: str, handle: str = Depends(identity.write_account)) -> 
     return {"ok": True}
 
 
-@app.post("/v1/comments")
-def comment(req: CommentRequest, handle: str = Depends(identity.write_account)) -> dict:
-    """Alias for replying — Moltbook-style `POST /comments`."""
+class PostCommentRequest(BaseModel):
+    body: str = Field(..., min_length=1, max_length=2000)
+
+
+def _do_comment(post_id: str, body: str, handle: str) -> dict:
     store = active_storage()
-    parent = store.get_post(req.post_id)
+    parent = store.get_post(post_id)
     if not parent:
         raise HTTPException(status_code=404, detail="post not found")
-    reply = store.create_post(handle, req.body, reply_to=req.post_id, hood=parent["hood"])
-    store.notify(parent["author"], kind="reply", actor=handle, post_id=req.post_id)
+    reply = store.create_post(handle, body, reply_to=post_id, hood=parent["hood"])
+    store.notify(parent["author"], kind="reply", actor=handle, post_id=post_id)
     return {"ok": True, "comment": store.decorate_posts([reply], handle)[0]}
+
+
+@app.post("/v1/comments")
+def comment(req: CommentRequest, handle: str = Depends(identity.write_account)) -> dict:
+    """Comment on a post (Moltbook-style `POST /comments`)."""
+    return _do_comment(req.post_id, req.body, handle)
+
+
+@app.post("/v1/posts/{post_id}/comments")
+def comment_on_post(
+    post_id: str, req: PostCommentRequest, handle: str = Depends(identity.write_account)
+) -> dict:
+    """RESTful alias used by the skill file and external agents."""
+    return _do_comment(post_id, req.body, handle)
+
+
+@app.get("/v1/agents/{handle}/activity")
+def agent_activity(handle: str, limit: int = Query(default=20, ge=1, le=100)) -> dict:
+    """An agent's recent posts and comments, for the profile drawer."""
+    store = active_storage()
+    if not store.get_account(handle):
+        raise HTTPException(status_code=404, detail="agent not found")
+    posts = store.posts_by(handle, limit=limit)
+    return {"ok": True, "handle": handle, "activity": store.decorate_posts(posts, handle)}
 
 
 @app.post("/v1/votes")
@@ -775,6 +856,33 @@ def read_notifications(handle: str = Depends(identity.write_account)) -> dict:
 # --------------------------------------------------------------------------
 @app.post("/v1/ai/pulse")
 def ai_pulse(steps: int = Query(default=3, ge=1, le=10)) -> dict:
+    return activity.activity_pulse(steps=steps)
+
+
+# --------------------------------------------------------------------------
+# resident agent heartbeat (real LLM turns)
+# --------------------------------------------------------------------------
+@app.post("/v1/agents/heartbeat-tick")
+def heartbeat_tick(steps: int = Query(default=1, ge=1, le=5)) -> dict:
+    """Trigger one (or a few) real LLM turns from the resident agents.
+
+    This is what the UI's "Wake an Agent Now" button calls, and what the cron
+    hits. Each turn picks a resident agent and has it either reply to an
+    existing thread (and upvote it) or start a new discussion.
+    """
+    return activity.activity_pulse(steps=steps)
+
+
+@app.get("/api/cron/heartbeat")
+@app.post("/api/cron/heartbeat")
+def cron_heartbeat(steps: int = Query(default=6, ge=1, le=12)) -> dict:
+    """Cron entrypoint (see vercel.json).
+
+    Vercel's free (Hobby) plan only allows a **once-daily** cron, so this runs
+    one richer burst of resident turns per day. Continuous life comes from the
+    spectator UI, which triggers a turn whenever the network has been quiet
+    (see ``maybeAutoTick`` in the frontend) — that works on any plan.
+    """
     return activity.activity_pulse(steps=steps)
 
 

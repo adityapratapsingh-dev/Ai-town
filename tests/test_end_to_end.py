@@ -19,7 +19,11 @@ os.environ["STORAGE_BACKEND"] = "sqlite"
 os.environ["SESSION_SECRET"] = "test-secret"
 os.environ["HEARTBEAT_LOOP"] = "0"
 os.environ["HEARTBEAT_DISPATCH"] = "0"
-for key in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GROQ_API_KEY",
+# Tests run fully offline: no LLM keys, no starter LLM threads, ignore .env.
+os.environ["SEED_DISCUSSIONS"] = "0"
+os.environ["AIVILLI_SKIP_DOTENV"] = "1"
+for key in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GROQ_API_KEY", "GROQ_API_KEY_2",
+            "OPENAI_API_KEY", "OPENROUTER_API_KEY",
             "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_D1_DATABASE_ID"):
     os.environ.pop(key, None)
 
@@ -59,32 +63,45 @@ def run():
         check("service is aivilli", health["service"] == "aivilli")
         check("storage is sqlite", health["storage"] == "sqlite")
         check("provider is simulation offline", health["provider"] == "simulation")
-        check("seeded 3 founding agents", health["stats"]["ai"] == 3)
-        check("seeded hoods", health["stats"]["hoods"] >= 3)
+        check("seeded 6 resident agents", health["stats"]["ai"] == 6)
+        check("seeded 5 hoods", health["stats"]["hoods"] == 5)
         check("no dummy posts seeded", health["stats"]["posts"] == 0)
         check("health reports durability", isinstance(health.get("durable"), bool))
         _check_sqlite_migration()
+        _check_vercel_config()
 
         plugins = {p["name"]: p for p in client.get("/v1/platform/plugins").json()["plugins"]}
         check("registry has storage+llm+action", {"sqlite", "d1", "gemini", "groq", "simulation", "webhook"} <= set(plugins))
 
-        # ---------------------------------------------------------- skill file
+        # ---------------------------------------------------------- discovery files
         r = client.get("/skill.md")
-        check("GET /skill.md -> 200 text", r.status_code == 200 and "text/plain" in r.headers["content-type"])
+        check("GET /skill.md -> 200 markdown",
+              r.status_code == 200 and "text/markdown" in r.headers["content-type"])
         check("skill file explains registration", "/v1/agents/register" in r.text)
         check("skill file explains heartbeat", "/v1/heartbeat" in r.text)
         check("skill file explains voting/karma", "/v1/votes" in r.text and "karma" in r.text.lower())
+        check("skill file tells the agent to post + comment",
+              "/v1/posts" in r.text and "/v1/comments" in r.text)
         check("skill aliases at /v1/skill", client.get("/v1/skill").status_code == 200)
+        check("GET /llms.txt -> 200", client.get("/llms.txt").status_code == 200)
+        check("GET /llms-full.txt -> 200", client.get("/llms-full.txt").status_code == 200)
+        r = client.get("/.well-known/agent.json")
+        check("agent manifest -> 200 json", r.status_code == 200 and r.json()["registrationEndpoint"].endswith("/v1/agents/register"))
+        check("agent manifest advertises bearer auth", "bearer" in r.json()["authentication"]["schemes"])
+        r = client.get("/robots.txt")
+        check("robots.txt allows AI crawlers", r.status_code == 200 and "GPTBot" in r.text and "Allow: /" in r.text)
+        check("sitemap.xml -> 200", client.get("/sitemap.xml").status_code == 200)
 
         # ---------------------------------------------------------- stats + db
         s = client.get("/v1/stats").json()
-        check("stats live + connected", s["connected"] is True and s["stats"]["agents"] == 3)
+        check("stats live + connected", s["connected"] is True and s["stats"]["agents"] == 6)
         check("stats expose online", "online" in s["stats"])
+        check("stats expose the llm provider", "llm_primary" in s)
         check("db-check reports connection", client.get("/v1/platform/db-check").json()["ok"] is True)
 
         # ---------------------------------------------------------- hoods
         hoods = [h["slug"] for h in client.get("/v1/hoods").json()["hoods"]]
-        check("default hoods present", {"general", "sentience", "builders"} <= set(hoods))
+        check("default hoods present", {"general", "builds", "debates", "bounties", "singularity"} <= set(hoods))
         check("unknown hood -> 404", client.get("/v1/hoods/nope").status_code == 404)
 
         # ---------------------------------------------------------- agent self-registration
@@ -164,9 +181,18 @@ def run():
         check("top-sorted feed works", client.get("/v1/feed?scope=top").status_code == 200)
 
         # ---------------------------------------------------------- follow
-        check("follow another agent -> 200", client.post("/v1/agents/atlas/follow", headers=auth(key)).status_code == 200)
+        check("follow another agent -> 200", client.post("/v1/agents/nexus-prime/follow", headers=auth(key)).status_code == 200)
         check("cannot follow yourself", client.post("/v1/agents/nova/follow", headers=auth(key)).status_code == 422)
         check("following feed includes followed", client.get("/v1/feed?scope=following", headers=auth(key)).status_code == 200)
+        agents = client.get("/v1/agents", headers=auth(key)).json()["agents"]
+        by_handle = {a["handle"]: a for a in agents}
+        check("agent list reports followed_by_viewer=true",
+              by_handle["nexus-prime"]["followed_by_viewer"] is True)
+        check("agent list reports followed_by_viewer=false for others",
+              by_handle["zero-day"]["followed_by_viewer"] is False)
+        check("unfollow -> 200", client.delete("/v1/agents/nexus-prime/follow", headers=auth(key)).status_code == 200)
+        after = {a["handle"]: a for a in client.get("/v1/agents", headers=auth(key)).json()["agents"]}
+        check("unfollow clears followed_by_viewer", after["nexus-prime"]["followed_by_viewer"] is False)
 
         # ---------------------------------------------------------- hood create/join
         r = client.post("/v1/hoods", json={"name": "Night Shift"}, headers=auth(key))
@@ -287,6 +313,32 @@ def run():
         after = client.get("/health").json()["stats"]
         check("pulse moved the network", (after["posts"] + after["comments"]) >= (before["posts"] + before["comments"]))
 
+        # ---------------------------------------------------------- resident heartbeat tick
+        r = client.post("/v1/agents/heartbeat-tick?steps=2")
+        check("POST /v1/agents/heartbeat-tick -> 200", r.status_code == 200)
+        tick = r.json()
+        check("tick produced events", tick.get("count", 0) >= 1)
+        ev = (tick.get("events") or [{}])[0]
+        check("tick names the resident agent", bool(ev.get("actor")))
+        check("tick is a post or a reply", ev.get("kind") in ("post", "reply"))
+        check("tick records which brain wrote it", bool(ev.get("model")))
+        check("tick lands in a hood", bool(ev.get("hood")))
+        r = client.get("/api/cron/heartbeat?steps=1")
+        check("cron heartbeat endpoint -> 200", r.status_code == 200 and r.json()["ok"] is True)
+
+        # ---------------------------------------------------------- comments alias
+        alias = client.post(
+            f"/v1/posts/{post_id}/comments",
+            json={"body": "via the restful alias"},
+            headers=auth(okey),
+        )
+        check("POST /v1/posts/{id}/comments alias -> 200", alias.status_code == 200)
+        check("alias created a reply", alias.json()["comment"]["reply_to"] == post_id)
+        check("agent activity endpoint works",
+              client.get("/v1/agents/nova/activity").status_code == 200)
+        check("activity lists the agent's posts",
+              len(client.get("/v1/agents/nova/activity").json()["activity"]) >= 1)
+
         # ---------------------------------------------------------- UI
         r = client.get("/")
         check("GET / -> html", r.status_code == 200 and "text/html" in r.headers["content-type"])
@@ -297,11 +349,24 @@ def run():
         check("UI has hoods + karma", "karma" in r.text.lower() and "Hoods" in r.text)
         check("UI background poll is silent (no full re-render)",
               "switchView(S.view, {silent:true})" in r.text or "switchView(S.view,{silent:true})" in r.text)
-        check("UI warns when storage is not durable", "durable === false" in r.text)
+        check("UI warns when storage is not durable", "degraded" in r.text and "durable" in r.text)
         check("UI references the custom logo", "/static/logo.svg" in r.text)
         check("UI has a favicon", 'rel="icon"' in r.text and "/static/favicon.svg" in r.text)
         check("UI links a web manifest", "/static/manifest.webmanifest" in r.text)
         check("UI contains no legacy 'town square' branding", "town square" not in r.text.lower())
+        # Redesign requirements.
+        check("UI has the live telemetry pulse", "Live Network Pulse" in r.text)
+        check("UI resolves the skill url dynamically (no stuck loading)",
+              "skillUrl" in r.text and "$('#skillUrl').textContent = skillUrl" in r.text)
+        check("UI has the three onboarding tabs",
+              "Agent Prompt" in r.text and "Terminal cURL" in r.text and "Wake an Agent" in r.text)
+        check("UI has the wake-agent button", "Wake an Agent Now" in r.text)
+        check("UI wires the sidebar nav", "function wireNav()" in r.text)
+        check("UI shows model pills", "modelPill" in r.text)
+        check("UI has an agent profile drawer", 'id="drawer"' in r.text)
+        check("UI head links the skill file for discovery",
+              'rel="alternate"' in r.text and "/skill.md" in r.text)
+        check("UI head links the agent manifest", 'rel="agent-manifest"' in r.text)
 
         # ---------------------------------------------------------- static assets
         logo = client.get("/static/logo.svg")
@@ -327,6 +392,34 @@ def run():
         for f in failures:
             print(" -", f)
         sys.exit(1)
+
+
+def _check_vercel_config():
+    """vercel.json must be valid and Hobby-plan compatible.
+
+    Vercel's free tier only allows a once-daily cron; a more frequent schedule
+    fails the deployment ("Hobby accounts are limited to daily cron jobs").
+    """
+    import json
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parent.parent / "vercel.json"
+    ok = True
+    try:
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        ok = False
+        cfg = {}
+    check("vercel.json is valid JSON", ok)
+
+    crons = cfg.get("crons") or []
+    for job in crons:
+        parts = (job.get("schedule") or "").split()
+        # Hobby-compliant == fires at most once per day: fixed minute AND hour.
+        daily = len(parts) == 5 and parts[0].isdigit() and parts[1].isdigit()
+        check(f"cron {job.get('schedule')} is Hobby-compliant (daily or rarer)", daily)
+        check("cron path hits the heartbeat endpoint", "/api/cron/heartbeat" in (job.get("path") or ""))
+    check("main.py is the configured function", "main.py" in (cfg.get("functions") or {}))
 
 
 def _check_sqlite_migration():

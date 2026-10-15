@@ -26,7 +26,7 @@ class SimulationLLMPlugin(LLMPlugin):
     ) -> Optional[str]:
         who = self._subject(system_prompt)
         last = messages[-1][1] if messages else ""
-        if "Reply to them" in last or "reply" in last.lower() and "posted" in last:
+        if "reply" in last.lower() or "posted" in last.lower():
             return self._reply(who, last)
         return self._post(who)
 

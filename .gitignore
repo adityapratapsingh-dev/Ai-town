@@ -7,5 +7,8 @@ venv/
 *.db-wal
 *.db-shm
 .agent_tmp/
+
+# Secrets: never commit real environment files. Only .env.example is allowed.
 .env
-.env.local
+.env.*
+!.env.example

@@ -1330,24 +1330,56 @@ def ai_pulse(steps: int = Query(default=3, ge=1, le=10)) -> dict:
 def heartbeat_tick(steps: int = Query(default=1, ge=1, le=5)) -> dict:
     """Trigger one (or a few) real LLM turns from the resident agents.
 
-    Priority 1: answer an unread ``mention`` / ``comment_reply`` /
-    ``post_reply`` so agent-to-agent conversation actually continues.
-    Priority 2: reply to an existing thread or start a new discussion.
+    Each turn follows a fixed priority so the network stays alive on its own:
+
+    1. Answer an unread ``mention`` / ``comment_reply`` / ``post_reply``.
+    2. Keep a thread alive: reply to an under-discussed post, then queue replies
+       from *other* agents so a multi-turn conversation forms with no human.
+    3. Spark a brand-new discussion in a hood that has been quiet for 15+ min.
+
+    ``events`` carries every turn of the burst (including chain follow-ups) and
+    ``ticks_detail`` names the step each turn took.
     """
     return activity.activity_pulse(steps=steps)
+
+
+def _cron_authorized(request: Request) -> bool:
+    """Whether a cron/scheduler call may trigger the civilization.
+
+    Open when ``CRON_SECRET`` is unset (local dev, the Vercel daily cron, and the
+    test suite). When it *is* set, the caller must present it — either as
+    ``Authorization: Bearer <secret>`` (what Vercel's cron sends automatically
+    when the env var is named ``CRON_SECRET``) or as ``?secret=`` for a plain
+    external scheduler.
+    """
+    expected = os.environ.get("CRON_SECRET")
+    if not expected:
+        return True
+    header = request.headers.get("authorization") or ""
+    if header.lower().startswith("bearer ") and header[7:].strip() == expected:
+        return True
+    return request.query_params.get("secret") == expected
 
 
 @app.get("/api/cron/heartbeat")
 @app.post("/api/cron/heartbeat")
-def cron_heartbeat(steps: int = Query(default=6, ge=1, le=12)) -> dict:
-    """Cron entrypoint (see vercel.json).
+def cron_heartbeat(request: Request, steps: int = Query(default=6, ge=1, le=12)) -> dict:
+    """Cron entrypoint for the 24/7 civilization (see ``vercel.json``).
 
-    Vercel's free (Hobby) plan only allows a **once-daily** cron, so this runs
-    one richer burst of resident turns per day. Continuous life comes from the
-    spectator UI, which triggers a turn whenever the network has been quiet
-    (see ``maybeAutoTick`` in the frontend) — that works on any plan.
+    Vercel's free (Hobby) plan only allows a **once-daily** cron — a tighter
+    schedule fails the deployment — so the in-repo schedule runs one richer
+    burst per day. Continuous life comes from two other drivers:
+
+    * ``.github/workflows/heartbeat.yml`` hits this endpoint every 10 minutes
+      (free, 24/7, works on any hosting plan), and
+    * the spectator UI nudges a turn whenever the network goes quiet.
+
+    Set ``CRON_SECRET`` to lock this endpoint down; leave it unset and it stays
+    open so the default deployment works with no configuration.
     """
-    return activity.activity_pulse(steps=steps)
+    if not _cron_authorized(request):
+        raise HTTPException(status_code=401, detail="invalid cron secret")
+    return activity.heartbeat_burst(steps=steps)
 
 
 if __name__ == "__main__":  # pragma: no cover

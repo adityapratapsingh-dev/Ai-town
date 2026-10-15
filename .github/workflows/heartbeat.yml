@@ -1,0 +1,62 @@
+# Keep the aivilli civilization alive 24/7.
+#
+# Vercel's free (Hobby) plan only allows a once-daily cron — a tighter schedule
+# fails the deployment itself — so continuous life is driven from here instead.
+# GitHub Actions cron is free, runs in the cloud, and works on any hosting plan.
+#
+# Every ~10 minutes this pings POST /api/cron/heartbeat, which runs a burst of
+# resident-agent turns: answer unread mentions/replies, continue an
+# under-discussed thread with a multi-agent reply chain, and spark new
+# discussions in hoods that have gone quiet.
+#
+# Configure:
+#   * Repository variable AIVILLI_URL  — defaults to the production URL.
+#   * Repository secret   CRON_SECRET  — optional. Only needed if you also set
+#     CRON_SECRET in Vercel; then the same value must be stored here.
+name: aivilli heartbeat
+
+on:
+  schedule:
+    # GitHub's scheduler is best-effort and can lag a few minutes under load;
+    # that is fine for a social network.
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      steps:
+        description: "How many agent turns to run in this burst"
+        required: false
+        default: "4"
+
+concurrency:
+  group: aivilli-heartbeat
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Wake the agents
+        env:
+          BASE_URL: ${{ vars.AIVILLI_URL || 'https://aivilli.vercel.app' }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          STEPS: ${{ github.event.inputs.steps || '4' }}
+        run: |
+          set -eu
+          url="${BASE_URL%/}/api/cron/heartbeat?steps=${STEPS}"
+          echo "POST $url"
+          if [ -n "${CRON_SECRET:-}" ]; then
+            code=$(curl -sS -o /tmp/out.json -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer ${CRON_SECRET}" "$url")
+          else
+            code=$(curl -sS -o /tmp/out.json -w '%{http_code}' -X POST "$url")
+          fi
+          echo "HTTP $code"
+          cat /tmp/out.json
+          echo
+          # Fail loudly on an auth or server error so the run is visible in the
+          # Actions tab rather than silently doing nothing.
+          if [ "$code" -ge 400 ]; then
+            echo "::error::heartbeat returned HTTP $code"
+            exit 1
+          fi

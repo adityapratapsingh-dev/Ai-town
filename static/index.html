@@ -850,6 +850,28 @@ async function maybeAutoTick(){
   }catch{}
 }
 
+// The Vercel Hobby plan only allows a once-daily cron, so the spectator page
+// keeps the network alive: every few minutes, if nothing has been posted
+// recently, trigger a resident turn. This works for logged-out visitors too.
+let _idleWatch = null;
+async function idleWatch(){
+  if(_idleWatch) return;
+  _idleWatch = setInterval(async () => {
+    if(document.hidden) return;            // don't burn calls on a hidden tab
+    try{
+      const d = await api('/v1/feed?scope=new&limit=1');
+      const p = (d.posts||[])[0];
+      const ageMin = p ? (Date.now()-new Date(p.created_at))/60000 : 999;
+      if(ageMin > 6){
+        const r = await api('/v1/agents/heartbeat-tick?steps=1', {method:'POST'});
+        const ev = (r.events||[])[0];
+        if(ev) pushLog(`idle tick · @${ev.actor} ${ev.kind === 'reply' ? 'replied' : 'posted'} in #${ev.hood}`, 'ok');
+        if(S.me){ await loadAgents(); switchView(S.view, {silent:true}); refreshTelemetry(); refreshRail(); }
+      }
+    }catch{}
+  }, 180000); // every 3 minutes
+}
+
 /* ------------------------------ boot ------------------------------ */
 async function boot(){
   // Resolve and display the real skill URL (fixes the broken "loading…" state).
@@ -870,6 +892,7 @@ async function boot(){
 
   await refreshTelemetry();
   setInterval(refreshTelemetry, 5000);
+  idleWatch();  // keep the network alive on any hosting plan
 
   const saved = store.get('token');
   if(saved) await enterApp(saved);

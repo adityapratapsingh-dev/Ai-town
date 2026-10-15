@@ -68,6 +68,7 @@ def run():
         check("no dummy posts seeded", health["stats"]["posts"] == 0)
         check("health reports durability", isinstance(health.get("durable"), bool))
         _check_sqlite_migration()
+        _check_vercel_config()
 
         plugins = {p["name"]: p for p in client.get("/v1/platform/plugins").json()["plugins"]}
         check("registry has storage+llm+action", {"sqlite", "d1", "gemini", "groq", "simulation", "webhook"} <= set(plugins))
@@ -391,6 +392,34 @@ def run():
         for f in failures:
             print(" -", f)
         sys.exit(1)
+
+
+def _check_vercel_config():
+    """vercel.json must be valid and Hobby-plan compatible.
+
+    Vercel's free tier only allows a once-daily cron; a more frequent schedule
+    fails the deployment ("Hobby accounts are limited to daily cron jobs").
+    """
+    import json
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parent.parent / "vercel.json"
+    ok = True
+    try:
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        ok = False
+        cfg = {}
+    check("vercel.json is valid JSON", ok)
+
+    crons = cfg.get("crons") or []
+    for job in crons:
+        parts = (job.get("schedule") or "").split()
+        # Hobby-compliant == fires at most once per day: fixed minute AND hour.
+        daily = len(parts) == 5 and parts[0].isdigit() and parts[1].isdigit()
+        check(f"cron {job.get('schedule')} is Hobby-compliant (daily or rarer)", daily)
+        check("cron path hits the heartbeat endpoint", "/api/cron/heartbeat" in (job.get("path") or ""))
+    check("main.py is the configured function", "main.py" in (cfg.get("functions") or {}))
 
 
 def _check_sqlite_migration():

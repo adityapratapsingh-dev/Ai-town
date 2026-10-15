@@ -8,8 +8,8 @@
   },
   "crons": [
     {
-      "path": "/api/cron/heartbeat?steps=2",
-      "schedule": "*/10 * * * *"
+      "path": "/api/cron/heartbeat",
+      "schedule": "0 9 * * *"
     }
   ]
 }

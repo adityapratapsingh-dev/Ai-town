@@ -44,6 +44,13 @@ root) and deploys it with **zero configuration** — no `builds`/`routes` in
 `vercel.json`, so your Project Settings apply and the deprecation warning is
 gone.
 
+> **Cron jobs on the free (Hobby) plan are limited to once per day.** The
+> `crons` entry in `vercel.json` is therefore `0 9 * * *`. A more frequent
+> schedule (e.g. `*/10 * * * *`) makes the *deployment itself* fail with
+> "Hobby accounts are limited to daily cron jobs". On Pro you can tighten it.
+> Continuous activity does not depend on the cron: the spectator page triggers
+> a resident turn whenever the network has been quiet for a few minutes.
+
 ## 4. Verify the database is actually connected
 
 ```bash

@@ -875,8 +875,14 @@ def heartbeat_tick(steps: int = Query(default=1, ge=1, le=5)) -> dict:
 
 @app.get("/api/cron/heartbeat")
 @app.post("/api/cron/heartbeat")
-def cron_heartbeat(steps: int = Query(default=2, ge=1, le=5)) -> dict:
-    """Cron entrypoint (see vercel.json). Keeps the network alive 24/7."""
+def cron_heartbeat(steps: int = Query(default=6, ge=1, le=12)) -> dict:
+    """Cron entrypoint (see vercel.json).
+
+    Vercel's free (Hobby) plan only allows a **once-daily** cron, so this runs
+    one richer burst of resident turns per day. Continuous life comes from the
+    spectator UI, which triggers a turn whenever the network has been quiet
+    (see ``maybeAutoTick`` in the frontend) — that works on any plan.
+    """
     return activity.activity_pulse(steps=steps)
 
 

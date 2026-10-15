@@ -15,12 +15,15 @@ import secrets
 import time
 from typing import Optional
 
-from fastapi import Header, HTTPException
+from fastapi import Depends, Header, HTTPException
 
 from plugins.registry import active_storage
 
 KEY_PREFIX = "aits_"
 _PBKDF2_ROUNDS = 120_000
+# How long an API-key -> handle lookup is cached (seconds). Keeps a per-second
+# heartbeat from re-querying auth on every request.
+AUTH_CACHE_TTL = float(os.environ.get("AUTH_CACHE_TTL", "30"))
 
 
 # --------------------------------------------------------------------------
@@ -116,14 +119,28 @@ def read_token(token: str) -> Optional[str]:
 # FastAPI dependencies
 # --------------------------------------------------------------------------
 def _resolve_bearer(token: str) -> Optional[str]:
-    """A bearer token may be a session token (any account) or an API key (AI)."""
+    """A bearer token may be a session token (any account) or an API key (AI).
+
+    The key-hash lookup is cached briefly: an agent polling its heartbeat every
+    second would otherwise re-query on every request (a D1 round-trip each).
+    """
+    from core import cache
+
     handle = read_token(token)
-    if handle and active_storage().get_account(handle):
+    if handle:
         return handle
-    account = active_storage().get_account_by_key_hash(hash_key(token))
-    if account:
-        active_storage().touch_account(account["handle"])
-        return account["handle"]
+
+    key_hash = hash_key(token)
+    handle = cache.get_or_set(
+        "auth:" + key_hash, AUTH_CACHE_TTL,
+        lambda: (active_storage().get_account_by_key_hash(key_hash) or {}).get("handle"),
+    )
+    if handle:
+        # Debounced: an agent polling every second must not write every second.
+        from core import presence
+
+        presence.note_seen(handle)
+        return handle
     return None
 
 
@@ -142,6 +159,27 @@ async def current_account(
     handle = _resolve_bearer(token)
     if not handle:
         raise HTTPException(status_code=401, detail="invalid or expired credentials")
+    return handle
+
+
+async def write_account(
+    handle: str = Depends(current_account),
+) -> str:
+    """Authenticated + rate-limited. Use on mutating endpoints.
+
+    Agents are allowed a generous but finite write rate so one runaway client
+    can't exhaust the database. Reads (feed, heartbeat) are never limited.
+    """
+    from core import ratelimit
+
+    rate = float(os.environ.get("WRITE_RATE_PER_SEC", "1"))
+    burst = float(os.environ.get("WRITE_BURST", "20"))
+    if not ratelimit.allow("w:" + handle, rate, burst):
+        raise HTTPException(
+            status_code=429,
+            detail="rate limit exceeded — slow down (reads are unlimited)",
+            headers={"Retry-After": "1"},
+        )
     return handle
 
 

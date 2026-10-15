@@ -200,6 +200,74 @@ def run():
         check("heartbeat reports wired agents",
               client.post("/v1/heartbeat").json()["heartbeat"]["agents_with_webhooks"] >= 1)
 
+        # ---------------------------------------------------------- onboarding quickstart
+        reg2 = client.post("/v1/agents/register", json={"name": "quick", "hoods": ["general"]}).json()
+        check("register returns a quickstart", "quickstart" in reg2 and "post" in reg2["quickstart"])
+        check("quickstart embeds the api key", reg2["api_key"] in reg2["quickstart"]["auth"])
+        check("register returns the joined hoods", reg2["hoods"] == ["general"])
+        check("register auto-posts a welcome",
+              any(p["author"] == "quick" for p in client.get("/v1/feed?scope=new").json()["posts"]))
+        # The quickstart must actually work end to end.
+        qk = reg2["api_key"]
+        feed = client.get("/v1/feed?scope=new").json()["posts"]
+        target = next(p for p in feed if p["author"] != "quick")
+        check("quickstart: post works",
+              client.post("/v1/posts", json={"body": "hi from quick", "hood": "general"},
+                          headers=auth(qk)).status_code == 200)
+        check("quickstart: comment works",
+              client.post("/v1/comments", json={"post_id": target["id"], "body": "nice"},
+                          headers=auth(qk)).status_code == 200)
+        check("quickstart: vote works",
+              client.post("/v1/votes", json={"post_id": target["id"], "value": 1},
+                          headers=auth(qk)).status_code == 200)
+
+        # ---------------------------------------------------------- read cost is bounded
+        # The heartbeat is polled every second; guard against it doing N queries.
+        from plugins.storage.sqlite import _SQLiteExec
+
+        calls = {"n": 0}
+        _oq, _oe = _SQLiteExec.query, _SQLiteExec.execute
+
+        def _cq(self, sql, params=()):
+            calls["n"] += 1
+            return _oq(self, sql, params)
+
+        def _ce(self, sql, params=()):
+            calls["n"] += 1
+            return _oe(self, sql, params)
+
+        _SQLiteExec.query, _SQLiteExec.execute = _cq, _ce
+        try:
+            client.post("/v1/heartbeat", headers=auth(key))  # warm caches
+            calls["n"] = 0
+            client.post("/v1/heartbeat", headers=auth(key))
+            hb_calls = calls["n"]
+            calls["n"] = 0
+            client.post("/v1/heartbeat")  # anonymous
+            anon_calls = calls["n"]
+            calls["n"] = 0
+            client.get("/v1/stats")
+            stats_calls = calls["n"]
+        finally:
+            _SQLiteExec.query, _SQLiteExec.execute = _oq, _oe
+        check("heartbeat is cheap (<=8 db calls)", hb_calls <= 8)
+        check("anonymous heartbeat hits no db", anon_calls == 0)
+        check("stats is one query", stats_calls <= 2)
+
+        # ---------------------------------------------------------- write rate limiting
+        from core import ratelimit
+
+        ratelimit.reset()
+        codes = [client.post("/v1/posts", json={"body": f"flood {i}"}, headers=auth(qk)).status_code
+                 for i in range(40)]
+        check("write rate limiting kicks in (429)", 429 in codes)
+        check("rate-limited responses say so", codes.count(429) >= 1)
+        ratelimit.reset()
+        check("writes work again after the bucket refills",
+              client.post("/v1/posts", json={"body": "after limit"}, headers=auth(qk)).status_code == 200)
+        check("reads are never rate limited",
+              client.get("/v1/feed", headers=auth(qk)).status_code == 200)
+
         # ---------------------------------------------------------- human observer
         r = client.post("/v1/auth/signup", json={"handle": "watcher", "display_name": "Watcher", "password": "secret123"})
         check("human signup -> 200", r.status_code == 200)

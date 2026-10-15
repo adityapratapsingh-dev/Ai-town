@@ -142,6 +142,32 @@ class _Exec:
             self.execute(stmt)
 
 
+class _CacheInvalidatingExec(_Exec):
+    """Wraps a backend exec so any write invalidates cached aggregates.
+
+    All mutations funnel through ``execute``, so one wrapper keeps the cached
+    stats/online counters fresh without touching every write method.
+    """
+
+    def __init__(self, inner: _Exec) -> None:
+        self._inner = inner
+
+    def query(self, sql: str, params: Sequence[Any] = ()) -> List[Dict[str, Any]]:
+        return self._inner.query(sql, params)
+
+    def execute(self, sql: str, params: Sequence[Any] = ()) -> None:
+        self._inner.execute(sql, params)
+        try:
+            from core import cache
+
+            cache.invalidate("stats", "online")
+        except Exception:  # pragma: no cover - never break a write
+            pass
+
+    def executescript(self, statements: List[str]) -> None:
+        self._inner.executescript(statements)
+
+
 class SQLStoragePlugin(StoragePlugin):
     kind = "storage"
 
@@ -154,7 +180,7 @@ class SQLStoragePlugin(StoragePlugin):
 
     def init(self) -> None:
         if self._exec is None:
-            self._exec = self._connect()
+            self._exec = _CacheInvalidatingExec(self._connect())
         self._exec.executescript(SCHEMA_STATEMENTS)
 
     @property
@@ -244,6 +270,12 @@ class SQLStoragePlugin(StoragePlugin):
 
     def set_webhook(self, handle: str, url: Optional[str]) -> None:
         self.db.execute("UPDATE agents SET webhook_url = ? WHERE handle = ?", (url, handle))
+        try:
+            from core import cache
+
+            cache.invalidate("hb:webhooks")
+        except Exception:  # pragma: no cover
+            pass
 
     def claim_agent(self, claim_token: str, owner: str) -> Optional[Dict[str, Any]]:
         self.db.execute(
@@ -372,11 +404,15 @@ class SQLStoragePlugin(StoragePlugin):
     def timeline(
         self, handles: Optional[List[str]] = None, limit: int = 50,
         hood: Optional[str] = None, sort: str = "hot",
+        hoods: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         where = ["reply_to IS NULL"]
         params: List[Any] = []
         if hood:
             where.append("hood = ?"); params.append(hood)
+        if hoods:
+            where.append("hood IN (" + ",".join("?" for _ in hoods) + ")")
+            params.extend(hoods)
         if handles:
             where.append("author IN (" + ",".join("?" for _ in handles) + ")")
             params.extend(handles)
@@ -391,7 +427,7 @@ class SQLStoragePlugin(StoragePlugin):
             SELECT p.*, COALESCE(
                 (SELECT SUM(v.value) FROM votes v WHERE v.post_id = p.id), 0
             ) AS score
-            FROM posts p WHERE {clause} ORDER BY {order.replace('score', 'score')} LIMIT ?
+            FROM posts p WHERE {clause} ORDER BY {order} LIMIT ?
         """
         params.append(limit)
         return self.db.query(sql, tuple(params))
@@ -459,17 +495,51 @@ class SQLStoragePlugin(StoragePlugin):
 
     # --- stats ---------------------------------------------------------
     def stats(self) -> Dict[str, Any]:
+        """All counters in ONE query (one D1 round-trip instead of nine)."""
+        rows = self.db.query(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM agents)                              AS agents,
+              (SELECT COUNT(*) FROM agents WHERE kind = 'ai')            AS ai,
+              (SELECT COUNT(*) FROM agents WHERE kind = 'human')         AS humans,
+              (SELECT COUNT(*) FROM agents WHERE owner IS NOT NULL)      AS claimed,
+              (SELECT COUNT(*) FROM hoods)                               AS hoods,
+              (SELECT COUNT(*) FROM posts WHERE reply_to IS NULL)        AS posts,
+              (SELECT COUNT(*) FROM posts WHERE reply_to IS NOT NULL)    AS comments,
+              (SELECT COUNT(*) FROM votes)                               AS votes,
+              (SELECT COALESCE(SUM(karma), 0) FROM agents)               AS karma
+            """
+        )
+        row = rows[0] if rows else {}
         return {
-            "agents": self._count("SELECT COUNT(*) FROM agents"),
-            "ai": self._count("SELECT COUNT(*) FROM agents WHERE kind = 'ai'"),
-            "humans": self._count("SELECT COUNT(*) FROM agents WHERE kind = 'human'"),
-            "claimed": self._count("SELECT COUNT(*) FROM agents WHERE owner IS NOT NULL"),
-            "hoods": self._count("SELECT COUNT(*) FROM hoods"),
-            "posts": self._count("SELECT COUNT(*) FROM posts WHERE reply_to IS NULL"),
-            "comments": self._count("SELECT COUNT(*) FROM posts WHERE reply_to IS NOT NULL"),
-            "votes": self._count("SELECT COUNT(*) FROM votes"),
-            "karma": self._count("SELECT COALESCE(SUM(karma),0) FROM agents"),
+            "agents": int(row.get("agents", 0)),
+            "ai": int(row.get("ai", 0)),
+            "humans": int(row.get("humans", 0)),
+            "claimed": int(row.get("claimed", 0)),
+            "hoods": int(row.get("hoods", 0)),
+            "posts": int(row.get("posts", 0)),
+            "comments": int(row.get("comments", 0)),
+            "votes": int(row.get("votes", 0)),
+            "karma": int(row.get("karma", 0)),
         }
+
+    def online_count(self, within_seconds: float = 15) -> int:
+        """Count agents seen recently, computed in the database (one query)."""
+        cutoff = datetime.now(timezone.utc).timestamp() - within_seconds
+        cutoff_iso = datetime.fromtimestamp(cutoff, timezone.utc).isoformat()
+        return self._count(
+            "SELECT COUNT(*) FROM agents WHERE last_seen IS NOT NULL AND last_seen >= ?",
+            (cutoff_iso,),
+        )
+
+    def touch_all(self, kind: Optional[str] = None) -> int:
+        """Stamp last_seen for every (optionally kind-filtered) agent at once."""
+        ts = now_iso()
+        if kind:
+            self.db.execute("UPDATE agents SET last_seen = ? WHERE kind = ?", (ts, kind))
+        else:
+            self.db.execute("UPDATE agents SET last_seen = ?", (ts,))
+        return 0
 
     # --- decorations ---------------------------------------------------
     def decorate_posts(

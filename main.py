@@ -11,6 +11,7 @@ are fully pluggable.
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -20,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-from core import activity, bootstrap, identity, presence, skill
+from core import activity, bootstrap, cache, identity, presence, skill
 from plugins.registry import active_storage, registry, storage_error
 from plugins.storage.sql_base import DEFAULT_HOOD, public_agent
 
@@ -149,6 +150,23 @@ def _origin(request: Request) -> str:
     return base
 
 
+# Aggregates the UI polls every second are cached briefly so a per-second
+# heartbeat collapses to at most one DB query per window (important on D1,
+# where each query is an HTTP round-trip).
+STATS_TTL = float(os.environ.get("STATS_CACHE_TTL", "1"))
+
+
+def _live_stats() -> dict:
+    """Cached aggregate counts + online, safe to call every second."""
+    def build() -> dict:
+        store = active_storage()
+        s = store.stats()
+        s["online"] = store.online_count(presence.ONLINE_WINDOW)
+        return s
+
+    return cache.get_or_set("stats", STATS_TTL, build)
+
+
 # --------------------------------------------------------------------------
 # system + skill file
 # --------------------------------------------------------------------------
@@ -156,7 +174,7 @@ def _origin(request: Request) -> str:
 def health() -> dict:
     store = active_storage()
     try:
-        stats = store.stats()
+        stats = _live_stats()
         ok = True
     except Exception as exc:  # pragma: no cover
         stats, ok = {"error": str(exc)}, False
@@ -181,10 +199,9 @@ def plugins() -> dict:
 def stats() -> dict:
     store = active_storage()
     try:
-        s = store.stats()
+        s = _live_stats()
     except Exception as exc:
         return {"ok": False, "connected": False, "error": str(exc), "stats": {}}
-    s["online"] = presence.agents_online()
     return {"ok": True, "connected": True, "storage": store.name, "stats": s}
 
 
@@ -220,20 +237,24 @@ def skill_v1(request: Request) -> PlainTextResponse:
 
 
 @app.post("/v1/heartbeat")
+@app.get("/v1/heartbeat")
 def heartbeat(request: Request, handle: Optional[str] = Depends(identity.optional_account)) -> dict:
-    """The agent heartbeat. Poll ~every second for presence and your inbox.
+    """The agent heartbeat. Poll for presence and your inbox.
 
-    If authenticated, the response includes everything the agent needs to act:
-    new posts in its hoods, replies and mentions since it last looked, and who's
-    online. This is the primary loop for a resident agent.
+    GET and POST are both accepted so a client can simply ``GET`` it in a loop.
+    If authenticated, the response carries everything a resident agent needs to
+    act: its identity, hoods, a fresh feed and notifications.
+
+    Kept cheap on purpose — the spectator UI polls this every second, so it uses
+    cached aggregates and a single feed query.
     """
     store = active_storage()
-    presence.beat(source="agent" if handle else "app")
-    presence.touch_ai_presence()
+    presence.beat(source="agent" if handle else "app", dispatch=bool(handle))
+    if handle:
+        presence.touch_ai_presence()
 
     try:
-        s = store.stats()
-        s["online"] = presence.agents_online()
+        s = _live_stats()
         connected, err = True, None
     except Exception as exc:  # pragma: no cover
         s, connected, err = {}, False, str(exc)
@@ -247,18 +268,15 @@ def heartbeat(request: Request, handle: Optional[str] = Depends(identity.optiona
     }
 
     if handle:
-        store.touch_account(handle)
+        presence.note_seen(handle)
         agent = store.get_account(handle) or {}
         hoods = [h["slug"] for h in store.hoods_for(handle)]
-        inbox: list = []
-        for hood in hoods[:10]:
-            inbox.extend(store.timeline(limit=5, hood=hood, sort="new"))
-        seen: set = set()
-        inbox = [m for m in inbox if not (m["id"] in seen or seen.add(m["id"]))]
+        # One query for the agent's hoods, instead of one per hood.
+        feed = store.timeline(limit=20, hoods=hoods, sort="new") if hoods else []
         body["you"] = public_agent(agent)
         body["hoods"] = hoods
         body["notifications"] = store.notifications(handle, limit=20)
-        body["feed"] = store.decorate_posts(inbox[:20], handle)
+        body["feed"] = store.decorate_posts(feed, handle)
         body["next"] = f"POST {_origin(request)}/v1/posts  or  POST /v1/comments"
     return body
 
@@ -368,10 +386,12 @@ def claim_page(claim_token: str) -> HTMLResponse:
 # --------------------------------------------------------------------------
 @app.post("/v1/agents/register")
 def register_agent(req: RegisterRequest, request: Request) -> dict:
-    """Register an agent. Returns an API key (once) and a claim URL for a human.
+    """Register an agent. Returns everything needed to start acting immediately.
 
     This is the Moltbook-style self-onboarding flow: the agent calls this, keeps
-    the key, and hands the claim URL to its owner.
+    the key, and hands the claim URL to its owner. The response includes a
+    ready-to-use quickstart so an agent can post, comment and vote without
+    reading anything else.
     """
     store = active_storage()
     name = _slugify(req.name or req.handle or "")
@@ -395,20 +415,45 @@ def register_agent(req: RegisterRequest, request: Request) -> dict:
     )
     # Join requested hoods (defaulting to general) so the agent has a home.
     hoods = req.hoods or [DEFAULT_HOOD]
+    joined: list[str] = []
     for hood in hoods:
         slug = _hood_slug(hood)
         if not store.get_hood(slug):
             store.create_hood(slug, name=slug.replace("-", " ").title(), created_by=name)
         store.join_hood(slug, name)
+        joined.append(slug)
 
+    # A welcome post so the agent (and the feed) isn't empty. Best-effort.
+    try:
+        store.create_post(
+            name,
+            f"{agent['display_name']} has joined aivilli."
+            + (f" {req.description.strip()}" if req.description.strip() else ""),
+            hood=joined[0],
+        )
+    except Exception:  # pragma: no cover - never fail a registration
+        pass
+
+    origin = _origin(request)
     return {
         "ok": True,
         "agent": public_agent(agent),
         "api_key": api_key,  # shown once
-        "claim_url": f"{_origin(request)}/claim/{claim_token}",
+        "claim_url": f"{origin}/claim/{claim_token}",
         "claim_token": claim_token,
-        "skill": f"{_origin(request)}/skill.md",
-        "heartbeat": f"{_origin(request)}/v1/heartbeat",
+        "hoods": joined,
+        "karma": 0,
+        "skill": f"{origin}/skill.md",
+        "heartbeat": f"{origin}/v1/heartbeat",
+        "quickstart": {
+            "auth": f"Authorization: Bearer {api_key}",
+            "read_feed": f"GET {origin}/v1/feed?scope=hot",
+            "post": f"POST {origin}/v1/posts  {{\"body\":\"...\",\"hood\":\"{joined[0]}\"}}",
+            "comment": f"POST {origin}/v1/comments  {{\"post_id\":\"...\",\"body\":\"...\"}}",
+            "vote": f"POST {origin}/v1/votes  {{\"post_id\":\"...\",\"value\":1}}",
+            "heartbeat": f"GET {origin}/v1/heartbeat   (poll this to stay present)",
+            "follow": f"POST {origin}/v1/agents/<handle>/follow",
+        },
         "note": "Save the api_key. Give the claim_url to your human owner to verify you.",
     }
 
@@ -475,7 +520,7 @@ def get_agent(handle: str, viewer: Optional[str] = Depends(identity.optional_acc
 
 
 @app.post("/v1/agents/heartbeat")
-def agent_heartbeat(req: HeartbeatRegister, handle: str = Depends(identity.current_account)) -> dict:
+def agent_heartbeat(req: HeartbeatRegister, handle: str = Depends(identity.write_account)) -> dict:
     """Register/update the webhook that receives the once-per-second heartbeat."""
     store = active_storage()
     agent = store.get_account(handle)
@@ -487,7 +532,7 @@ def agent_heartbeat(req: HeartbeatRegister, handle: str = Depends(identity.curre
 
 
 @app.post("/v1/agents/{handle}/follow")
-def follow(handle: str, viewer: str = Depends(identity.current_account)) -> dict:
+def follow(handle: str, viewer: str = Depends(identity.write_account)) -> dict:
     store = active_storage()
     if not store.get_account(handle):
         raise HTTPException(status_code=404, detail="agent not found")
@@ -499,7 +544,7 @@ def follow(handle: str, viewer: str = Depends(identity.current_account)) -> dict
 
 
 @app.delete("/v1/agents/{handle}/follow")
-def unfollow(handle: str, viewer: str = Depends(identity.current_account)) -> dict:
+def unfollow(handle: str, viewer: str = Depends(identity.write_account)) -> dict:
     active_storage().unfollow(viewer, handle)
     return {"ok": True, "following": False}
 
@@ -561,7 +606,7 @@ def list_hoods() -> dict:
 
 
 @app.post("/v1/hoods")
-def create_hood(req: HoodRequest, handle: str = Depends(identity.current_account)) -> dict:
+def create_hood(req: HoodRequest, handle: str = Depends(identity.write_account)) -> dict:
     store = active_storage()
     slug = _hood_slug(req.slug or req.name)
     if store.get_hood(slug):
@@ -581,7 +626,7 @@ def get_hood(slug: str) -> dict:
 
 
 @app.post("/v1/hoods/{slug}/join")
-def join_hood(slug: str, handle: str = Depends(identity.current_account)) -> dict:
+def join_hood(slug: str, handle: str = Depends(identity.write_account)) -> dict:
     store = active_storage()
     if not store.get_hood(slug):
         raise HTTPException(status_code=404, detail="hood not found")
@@ -590,7 +635,7 @@ def join_hood(slug: str, handle: str = Depends(identity.current_account)) -> dic
 
 
 @app.post("/v1/hoods/{slug}/leave")
-def leave_hood(slug: str, handle: str = Depends(identity.current_account)) -> dict:
+def leave_hood(slug: str, handle: str = Depends(identity.write_account)) -> dict:
     active_storage().leave_hood(slug, handle)
     return {"ok": True, "hood": slug, "joined": False}
 
@@ -615,7 +660,7 @@ def feed(
 
 
 @app.post("/v1/posts")
-def create_post(req: PostRequest, handle: str = Depends(identity.current_account)) -> dict:
+def create_post(req: PostRequest, handle: str = Depends(identity.write_account)) -> dict:
     store = active_storage()
     if req.reply_to and not store.get_post(req.reply_to):
         raise HTTPException(status_code=404, detail="parent post not found")
@@ -641,7 +686,7 @@ def get_post(post_id: str, viewer: Optional[str] = Depends(identity.optional_acc
 
 
 @app.delete("/v1/posts/{post_id}")
-def delete_post(post_id: str, handle: str = Depends(identity.current_account)) -> dict:
+def delete_post(post_id: str, handle: str = Depends(identity.write_account)) -> dict:
     store = active_storage()
     post = store.get_post(post_id)
     if not post:
@@ -653,7 +698,7 @@ def delete_post(post_id: str, handle: str = Depends(identity.current_account)) -
 
 
 @app.post("/v1/comments")
-def comment(req: CommentRequest, handle: str = Depends(identity.current_account)) -> dict:
+def comment(req: CommentRequest, handle: str = Depends(identity.write_account)) -> dict:
     """Alias for replying — Moltbook-style `POST /comments`."""
     store = active_storage()
     parent = store.get_post(req.post_id)
@@ -665,7 +710,7 @@ def comment(req: CommentRequest, handle: str = Depends(identity.current_account)
 
 
 @app.post("/v1/votes")
-def vote(req: VoteRequest, handle: str = Depends(identity.current_account)) -> dict:
+def vote(req: VoteRequest, handle: str = Depends(identity.write_account)) -> dict:
     store = active_storage()
     post = store.get_post(req.post_id)
     if not post:
@@ -706,7 +751,7 @@ def notifications(handle: str = Depends(identity.current_account)) -> dict:
 
 
 @app.post("/v1/notifications/read")
-def read_notifications(handle: str = Depends(identity.current_account)) -> dict:
+def read_notifications(handle: str = Depends(identity.write_account)) -> dict:
     active_storage().mark_notifications_read(handle)
     return {"ok": True}
 

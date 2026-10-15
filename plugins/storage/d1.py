@@ -20,6 +20,7 @@ statements issued by the engine are small and indexed.
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, List, Sequence
 
 import httpx
@@ -38,14 +39,23 @@ class _D1Exec(_Exec):
         api_base: str = DEFAULT_API_BASE,
         timeout: float = 20.0,
         transport: "httpx.BaseTransport | None" = None,
+        max_retries: int = 2,
+        retry_backoff: float = 0.25,
     ) -> None:
         self.account_id = account_id
         self.database_id = database_id
         self.api_token = api_token
         self.api_base = api_base.rstrip("/")
         self.timeout = timeout
+        self.max_retries = max(0, max_retries)
+        self.retry_backoff = retry_backoff
+        # A keep-alive pool reuses the TLS connection across queries — the
+        # difference between ~5ms and a fresh handshake on every round-trip.
+        limits = httpx.Limits(max_keepalive_connections=8, max_connections=16)
         # Injectable transport keeps the plugin testable without a network.
-        self._client = httpx.Client(transport=transport, timeout=timeout)
+        self._client = httpx.Client(
+            transport=transport, timeout=timeout, limits=limits
+        )
 
     @property
     def _url(self) -> str:
@@ -55,22 +65,44 @@ class _D1Exec(_Exec):
         )
 
     def _run(self, sql: str, params: Sequence[Any]) -> List[dict]:
-        resp = self._client.post(
-            self._url,
-            headers={"Authorization": f"Bearer {self.api_token}"},
-            json={"sql": sql, "params": [p for p in params]},
-        )
-        resp.raise_for_status()
-        body = resp.json()
-        if not body.get("success", False):
-            raise RuntimeError(f"D1 query failed: {body.get('errors')}")
-        results = body.get("result") or []
-        if not results:
-            return []
-        first = results[0]
-        if first.get("success") is False:
-            raise RuntimeError(f"D1 statement failed: {first.get('results')}")
-        return first.get("results") or []
+        last_exc: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                resp = self._client.post(
+                    self._url,
+                    headers={"Authorization": f"Bearer {self.api_token}"},
+                    json={"sql": sql, "params": [p for p in params]},
+                )
+                # Retry transient server-side failures; never retry 4xx (bad
+                # credentials / bad SQL won't get better on a second try).
+                if resp.status_code >= 500 or resp.status_code == 429:
+                    raise httpx.HTTPStatusError(
+                        f"transient {resp.status_code}", request=resp.request, response=resp
+                    )
+                resp.raise_for_status()
+                body = resp.json()
+                if not body.get("success", False):
+                    raise RuntimeError(f"D1 query failed: {body.get('errors')}")
+                results = body.get("result") or []
+                if not results:
+                    return []
+                first = results[0]
+                if first.get("success") is False:
+                    raise RuntimeError(f"D1 statement failed: {first.get('results')}")
+                return first.get("results") or []
+            except (httpx.TransportError, httpx.HTTPStatusError, ValueError) as exc:
+                # ValueError covers a malformed/empty JSON body from a proxy.
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status is not None and 400 <= status < 500 and status != 429:
+                    raise
+                last_exc = exc
+                if attempt < self.max_retries:
+                    time.sleep(self.retry_backoff * (2 ** attempt))
+                    continue
+                raise
+        if last_exc:  # pragma: no cover - defensive
+            raise last_exc
+        return []
 
     def query(self, sql: str, params: Sequence[Any] = ()) -> List[dict]:
         return [dict(r) for r in self._run(sql, params)]

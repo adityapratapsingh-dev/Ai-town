@@ -44,6 +44,16 @@ DISPATCH = _flag("HEARTBEAT_DISPATCH", True)
 # Background thread: default on locally, off on Vercel (threads don't persist).
 LOOP_DEFAULT = not bool(os.environ.get("VERCEL"))
 LOOP = _flag("HEARTBEAT_LOOP", LOOP_DEFAULT)
+# How long the webhook-subscriber list is cached (seconds).
+WEBHOOK_CACHE_TTL = float(os.environ.get("HEARTBEAT_WEBHOOK_CACHE_TTL", "5"))
+# How long a presence write is debounced (seconds). The UI polls every second;
+# we don't want a DB write on every poll.
+PRESENCE_DEBOUNCE = float(os.environ.get("HEARTBEAT_PRESENCE_DEBOUNCE", "10"))
+ONLINE_CACHE_TTL = float(os.environ.get("HEARTBEAT_ONLINE_CACHE_TTL", "2"))
+
+_ai_touch_at = 0.0
+_seen: Dict[str, float] = {}
+_seen_lock = threading.Lock()
 
 _state_lock = threading.Lock()
 _state: Dict[str, Any] = {
@@ -75,12 +85,20 @@ def payload() -> Dict[str, Any]:
 
 
 def _ai_with_webhooks() -> List[Dict[str, Any]]:
-    store = active_storage()
-    return [
-        a
-        for a in store.list_accounts(kind="ai")
-        if a.get("webhook_url")
-    ]
+    """AI agents that registered a webhook. Cached briefly: this is read on
+    every beat, and the set changes rarely."""
+    from core import cache
+
+    def build() -> List[Dict[str, Any]]:
+        try:
+            return [
+                a for a in active_storage().list_accounts(kind="ai")
+                if a.get("webhook_url")
+            ]
+        except Exception:
+            return []
+
+    return cache.get_or_set("hb:webhooks", WEBHOOK_CACHE_TTL, build)
 
 
 def _dispatch_once() -> Dict[str, int]:
@@ -129,38 +147,54 @@ def beat(source: str = "app", dispatch: Optional[bool] = None) -> Dict[str, Any]
 
 
 def touch_ai_presence() -> int:
-    """Refresh `last_seen` for AI accounts so the UI can show them online."""
+    """Refresh `last_seen` for AI agents so the UI can show them online.
+
+    Debounced: the write (one UPDATE for every agent) only happens once per
+    PRESENCE_DEBOUNCE window, so a per-second heartbeat doesn't write to the
+    database every second.
+    """
+    global _ai_touch_at
     store = active_storage()
-    online = 0
-    for account in store.list_accounts(kind="ai"):
-        try:
-            store.touch_account(account["handle"])
-            online += 1
-        except Exception:
-            continue
+    now = time.monotonic()
+    with _seen_lock:
+        if now - _ai_touch_at < PRESENCE_DEBOUNCE:
+            with _state_lock:
+                return _state["agents_online"]
+        _ai_touch_at = now
+    try:
+        store.touch_all(kind="ai")
+        online = store.online_count(ONLINE_WINDOW)
+    except Exception:
+        return 0
     with _state_lock:
         _state["agents_online"] = online
     return online
 
 
-def agents_online() -> int:
-    """Count AI accounts seen within the online window."""
-    store = active_storage()
-    cutoff = time.time() - ONLINE_WINDOW
-    count = 0
-    for account in store.list_accounts(kind="ai"):
-        last = account.get("last_seen")
-        if not last:
-            continue
-        try:
-            from datetime import datetime
+def note_seen(handle: str) -> None:
+    """Record that an agent was active, debounced to one write per window."""
+    now = time.monotonic()
+    with _seen_lock:
+        if now - _seen.get(handle, 0.0) < PRESENCE_DEBOUNCE:
+            return
+        _seen[handle] = now
+    try:
+        active_storage().touch_account(handle)
+    except Exception:
+        pass
 
-            seen = datetime.fromisoformat(last).timestamp()
+
+def agents_online() -> int:
+    """Count AI agents seen within the online window (one query, cached)."""
+    from core import cache
+
+    def build() -> int:
+        try:
+            return active_storage().online_count(ONLINE_WINDOW)
         except Exception:
-            continue
-        if seen >= cutoff:
-            count += 1
-    return count
+            return 0
+
+    return cache.get_or_set("online", ONLINE_CACHE_TTL, build)
 
 
 def summary() -> Dict[str, Any]:
@@ -177,7 +211,8 @@ def summary() -> Dict[str, Any]:
         "dispatched": snapshot["dispatched"],
         "dispatch_failures": snapshot["dispatch_failures"],
         "agents_with_webhooks": len(_ai_with_webhooks()) if ENABLED else 0,
-        "agents_online": agents_online(),
+        # Read from state (updated by touch_ai_presence) — no extra query.
+        "agents_online": snapshot.get("agents_online", 0),
     }
 
 

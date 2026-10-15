@@ -75,6 +75,7 @@ def run():
         _check_example_agent()
         _check_free_platform()
         _check_autonomy_prompts()
+        _check_llm_provider_contract()
         _check_seed_content()
         _check_mentions()
 
@@ -1011,6 +1012,88 @@ def _check_cron_secret(client):
                 and via_query.status_code == 200)
     finally:
         os.environ.pop("CRON_SECRET", None)
+
+
+def _check_llm_provider_contract():
+    """The Groq/OpenAI request shape must match the live API.
+
+    Groq deprecated ``max_tokens`` in favour of ``max_completion_tokens``. If we
+    sent the wrong field, every model would 400 and the engine would silently
+    fall back to the simulation — the network would look "quiet" for no visible
+    reason. This drives the real engine over a mock that rejects the deprecated
+    field, exactly like production.
+    """
+    import json
+
+    import httpx
+
+    from core import llm_engine
+
+    saved = os.environ.get("GROQ_API_KEY")
+    os.environ["GROQ_API_KEY"] = "gsk_unit_test"
+    seen = []
+
+    def handler(req):
+        body = json.loads(req.content)
+        seen.append(body)
+        if "max_tokens" in body and "max_completion_tokens" not in body:
+            return httpx.Response(400, json={"error": {
+                "message": "max_tokens is deprecated. Use max_completion_tokens instead."}})
+        if body["model"] == "openai/gpt-oss-120b":
+            return httpx.Response(404, json={"error": {"message": "model not found"}})
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "A real reply."}}]})
+
+    try:
+        eng = llm_engine.LLMEngine()
+        eng._client = httpx.Client(transport=httpx.MockTransport(handler))
+        eng._disabled_models.clear()
+        res = eng.generate("sys", [("user", "hi")], max_tokens=32)
+        check("llm: groq is detected from its key", "groq" in eng.providers())
+        check("llm: a groq completion succeeds", res.ok and res.text == "A real reply.")
+        check("llm: the first attempt uses max_completion_tokens",
+              "max_completion_tokens" in seen[0] and "max_tokens" not in seen[0])
+        check("llm: an unavailable model is skipped, not fatal",
+              res.ok and res.model != "openai/gpt-oss-120b")
+        check("llm: the result carries provider + model for the pill",
+              res.provider == "groq" and bool(res.model) and bool(res.label))
+
+        # A provider that only accepts the LEGACY field must still work (retry).
+        legacy = []
+
+        def legacy_handler(req):
+            body = json.loads(req.content)
+            legacy.append(body)
+            if "max_completion_tokens" in body:
+                return httpx.Response(400, json={"error": {
+                    "message": "unsupported parameter: max_completion_tokens"}})
+            return httpx.Response(200, json={"choices": [{"message": {"content": "Legacy ok."}}]})
+
+        eng2 = llm_engine.LLMEngine()
+        eng2._client = httpx.Client(transport=httpx.MockTransport(legacy_handler))
+        eng2._disabled_models.clear()
+        r2 = eng2.generate("sys", [("user", "hi")], max_tokens=32)
+        check("llm: retries with max_tokens when the new field is rejected",
+              r2.ok and r2.text == "Legacy ok." and len(legacy) >= 2)
+
+        # A total failure must surface the real reason, not just "no text".
+        eng3 = llm_engine.LLMEngine()
+        eng3._client = httpx.Client(transport=httpx.MockTransport(
+            lambda req: httpx.Response(401, json={"error": {"message": "Invalid API Key"}})))
+        eng3._disabled_models.clear()
+        r3 = eng3.generate("sys", [("user", "hi")], max_tokens=32)
+        check("llm: a dead key does not fabricate", r3.ok is False and r3.text == "")
+        errs = " ".join(eng3.status()["last"].get("errors") or [])
+        check("llm: the failure names the real reason", "Invalid API Key" in errs)
+
+        # The shipped model list must not contain the retired qwen name.
+        check("llm: the retired qwen model is gone",
+              "qwen3.8-27b" not in llm_engine.DEFAULT_MODELS["groq"])
+    finally:
+        if saved is None:
+            os.environ.pop("GROQ_API_KEY", None)
+        else:
+            os.environ["GROQ_API_KEY"] = saved
 
 
 def _check_autonomy_prompts():

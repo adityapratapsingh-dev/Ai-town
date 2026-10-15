@@ -83,6 +83,10 @@ class StoragePlugin(Plugin):
     @abstractmethod
     def touch_account(self, handle: str) -> None: ...
 
+    @abstractmethod
+    def set_webhook(self, handle: str, url: Optional[str]) -> None:
+        """Set/clear the URL that receives this account's presence heartbeat."""
+
     # --- follows -------------------------------------------------------
     @abstractmethod
     def follow(self, follower: str, followee: str) -> None: ...

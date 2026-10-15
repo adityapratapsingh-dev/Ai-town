@@ -17,6 +17,10 @@ TEST_DB = "/tmp/ai_society_test.db"
 os.environ["AI_SOCIETY_DB"] = TEST_DB
 os.environ["STORAGE_BACKEND"] = "sqlite"
 os.environ["SESSION_SECRET"] = "test-secret"
+# Keep the heartbeat deterministic in tests: no background thread, and don't
+# attempt real outbound webhook deliveries.
+os.environ["HEARTBEAT_LOOP"] = "0"
+os.environ["HEARTBEAT_DISPATCH"] = "0"
 for key in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GROQ_API_KEY",
             "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_D1_DATABASE_ID"):
     os.environ.pop(key, None)
@@ -57,11 +61,31 @@ def run():
         check("storage is sqlite", health["storage"] == "sqlite")
         check("provider is simulation offline", health["provider"] == "simulation")
         check("seeded 3 AI accounts", health["stats"]["ai"] == 3)
-        check("seeded starter posts", health["stats"]["posts"] >= 4)
+        check("no dummy starter posts", health["stats"]["posts"] == 0)
 
         plugins = {p["name"]: p for p in client.get("/v1/platform/plugins").json()["plugins"]}
         check("registry has storage+llm+action", {"sqlite", "d1", "gemini", "groq", "simulation", "webhook"} <= set(plugins))
         check("d1 unconfigured offline", plugins["d1"]["healthy"] is False)
+
+        # ---------------------------------------------------------- live stats (db-backed)
+        r = client.get("/v1/stats")
+        check("GET /v1/stats -> 200", r.status_code == 200)
+        s = r.json()
+        check("stats are live + connected", s["connected"] is True and s["stats"]["accounts"] == 3)
+        check("stats expose online count", "online" in s["stats"])
+
+        r = client.get("/v1/platform/db-check")
+        check("db-check reports connection", r.json()["ok"] is True and r.json()["connected"] is True)
+        check("db-check names the storage backend", r.json()["storage"] == "sqlite")
+
+        # ---------------------------------------------------------- heartbeat
+        r = client.post("/v1/heartbeat")
+        check("POST /v1/heartbeat -> 200", r.status_code == 200)
+        hb = r.json()
+        check("heartbeat records a beat", hb["heartbeat"]["beats"] >= 1)
+        check("heartbeat interval is 1s", hb["heartbeat"]["interval_seconds"] == 1)
+        check("heartbeat returns live stats", hb["stats"]["accounts"] == 3)
+        check("heartbeat carries a timestamp", isinstance(hb["heartbeat"]["last_beat"], float))
 
         # ---------------------------------------------------------- UI
         r = client.get("/")
@@ -69,6 +93,9 @@ def run():
         check("UI has human/AI toggle", "I&#39;m an AI Agent" in r.text or "I'm an AI Agent" in r.text)
         check("UI calls signup+login", "/v1/auth/signup" in r.text and "/v1/auth/login" in r.text)
         check("UI renders a feed", "/v1/posts" in r.text)
+        check("UI drives the heartbeat every second", "/v1/heartbeat" in r.text and "setInterval(pollStats, 1000)" in r.text)
+        check("UI exposes the heartbeat webhook field", "Heartbeat webhook URL" in r.text)
+        check("UI has no placeholder stat dashes", 'id="hs-accounts">—' not in r.text)
 
         # ---------------------------------------------------------- accounts listing
         r = client.get("/v1/accounts")
@@ -88,13 +115,24 @@ def run():
         check("weak password rejected", client.post("/v1/auth/signup", json={"handle": "weakling", "kind": "human", "password": "123"}).status_code == 422)
 
         # ---------------------------------------------------------- AI signup
-        r = client.post("/v1/auth/signup", json={"handle": "nova", "display_name": "Nova", "kind": "ai", "persona": "space weather analyst"})
+        r = client.post("/v1/auth/signup", json={"handle": "nova", "display_name": "Nova", "kind": "ai",
+                                                 "persona": "space weather analyst",
+                                                 "webhook_url": "https://example.test/nova/heartbeat"})
         check("AI signup -> 200", r.status_code == 200)
         ai = r.json()
         ai_key = ai["api_key"]
         aitok = ai["token"]
         check("AI signup returns an api key", ai_key.startswith("aits_"))
         check("AI account kind is ai", ai["account"]["kind"] == "ai")
+        check("AI signup stores the heartbeat webhook", ai["account"]["webhook_url"].endswith("/nova/heartbeat"))
+        check("heartbeat reports the wired agent", client.post("/v1/heartbeat").json()["heartbeat"]["agents_with_webhooks"] >= 1)
+        check("agent can re-register its heartbeat webhook",
+              client.post("/v1/agents/heartbeat", json={"webhook_url": "https://example.test/nova/hb2"},
+                          headers=auth(aitok)).status_code == 200)
+        check("an AI agent counts as online after beating", client.post("/v1/heartbeat").json()["stats"]["online"] >= 1)
+        # A top-level post from the AI agent, so the discover feed has a peer.
+        r = client.post("/v1/posts", json={"body": "Nova online. Solar wind is calm today."}, headers=auth(aitok))
+        check("AI agent can publish a top-level post", r.status_code == 200)
 
         # ---------------------------------------------------------- login
         check("human login works", client.post("/v1/auth/login", json={"handle": "aditya", "password": "secret123"}).status_code == 200)
@@ -149,7 +187,8 @@ def run():
         following = client.get("/v1/posts?scope=following", headers=auth(htok)).json()["posts"]
         check("following feed includes own + followed posts", any(p["author"] == "aditya" for p in following))
         discover = client.get("/v1/posts?scope=discover").json()["posts"]
-        check("discover feed is global", len(discover) >= 4)
+        authors = {p["author"] for p in discover}
+        check("discover feed is global", {"aditya", "nova"} <= authors and len(discover) >= 2)
         prof = client.get("/v1/posts?scope=profile&handle=nova").json()["posts"]
         check("profile feed is scoped", all(p["author"] == "nova" for p in prof))
 
@@ -226,6 +265,7 @@ def _check_d1_backend():
     plugin.init()
     plugin.create_account("d1user", display_name="D1 User", kind="human", password_hash="x")
     plugin.create_account("d1bot", display_name="D1 Bot", kind="ai", api_key_hash="y")
+    plugin.set_webhook("d1bot", "https://example.test/d1/heartbeat")
     plugin.follow("d1user", "d1bot")
     post = plugin.create_post("d1bot", "hello from d1")
     plugin.like("d1user", post["id"])
@@ -242,6 +282,8 @@ def _check_d1_backend():
     check("d1: notification stored", len(plugin.notifications("d1bot")) == 1)
     check("d1: stats aggregate", stats["accounts"] == 2 and stats["posts"] == 1)
     check("d1: uuid ids", isinstance(post["id"], str) and len(post["id"]) == 32)
+    check("d1: heartbeat webhook persisted",
+          plugin.get_account("d1bot")["webhook_url"].endswith("/d1/heartbeat"))
 
 
 if __name__ == "__main__":

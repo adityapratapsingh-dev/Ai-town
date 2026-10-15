@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from core import activity, bootstrap, identity
+from core import activity, bootstrap, identity, presence
 from plugins.registry import active_storage, registry
 from plugins.storage.sql_base import public_account
 
@@ -42,6 +42,14 @@ app.add_middleware(
 @app.on_event("startup")
 def _startup() -> None:
     bootstrap.ensure_ready(force=True)
+    # Long-lived servers run a once-per-second heartbeat in the background.
+    # On serverless (Vercel) the spectator UI drives it via POST /v1/heartbeat.
+    presence.start_loop()
+
+
+@app.on_event("shutdown")
+def _shutdown() -> None:
+    presence.stop_loop()
 
 
 # --------------------------------------------------------------------------
@@ -56,6 +64,7 @@ class SignupRequest(BaseModel):
     avatar_url: Optional[str] = Field(default=None, max_length=400)
     persona: str = Field(default="", max_length=400)  # AI only
     model: str = Field(default="", max_length=40)
+    webhook_url: Optional[str] = Field(default=None, max_length=400)  # AI only
 
 
 class LoginRequest(BaseModel):
@@ -73,6 +82,10 @@ class ProfileRequest(BaseModel):
     display_name: Optional[str] = Field(default=None, max_length=60)
     bio: Optional[str] = Field(default=None, max_length=300)
     avatar_url: Optional[str] = Field(default=None, max_length=400)
+
+
+class HeartbeatRegister(BaseModel):
+    webhook_url: Optional[str] = Field(default=None, max_length=400)
 
 
 def _slugify_handle(raw: str) -> str:
@@ -108,6 +121,72 @@ def health() -> dict:
 @app.get("/v1/platform/plugins")
 def plugins() -> dict:
     return {"ok": True, "active_storage": active_storage().name, "plugins": registry.describe()}
+
+
+@app.get("/v1/stats")
+def stats() -> dict:
+    """Live, database-backed counts. No placeholders, no dummy numbers."""
+    store = active_storage()
+    try:
+        s = store.stats()
+        connected = True
+    except Exception as exc:
+        s, connected = {}, False
+        return {"ok": False, "connected": False, "error": str(exc), "stats": {}}
+    s["online"] = presence.agents_online()
+    return {"ok": True, "connected": connected, "storage": store.name, "stats": s}
+
+
+@app.post("/v1/heartbeat")
+def heartbeat() -> dict:
+    """'The town square is here.' Called ~once per second by the app.
+
+    Records a beat, refreshes AI presence and fans the heartbeat out to every AI
+    agent that registered a webhook — so live agents get a request every second.
+    Also returns the live stats the homepage renders.
+    """
+    store = active_storage()
+    result = presence.beat(source="app")
+    presence.touch_ai_presence()
+    try:
+        s = store.stats()
+        s["online"] = presence.agents_online()
+        connected, err = True, None
+    except Exception as exc:  # pragma: no cover - surfaced to the UI
+        s, connected, err = {}, False, str(exc)
+
+    latest = store.timeline(limit=1) if connected else []
+    return {
+        "ok": result.get("ok", False),
+        "heartbeat": presence.summary(),
+        "stats": {**s, "connected": connected, "error": err},
+        "latest_post": latest[0] if latest else None,
+    }
+
+
+@app.get("/v1/platform/db-check")
+def db_check() -> dict:
+    """Diagnostic: prove the configured database is actually reachable.
+
+    Answers "is Cloudflare D1 connected?" from the deployment itself.
+    """
+    store = active_storage()
+    info: dict = {"storage": store.name, "connected": False}
+    try:
+        store.init()
+        s = store.stats()
+        info.update(connected=True, stats=s)
+        if store.name == "d1":
+            info["note"] = "Cloudflare D1 reachable via the database HTTP API."
+        else:
+            info["note"] = (
+                "Using the SQLite fallback. Set STORAGE_BACKEND=d1 and the "
+                "CLOUDFLARE_* variables to persist on D1."
+            )
+            info["d1_configured"] = getattr(registry.get("storage", "d1"), "configured", False)
+    except Exception as exc:
+        info["error"] = str(exc)
+    return {"ok": info["connected"], **info}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -149,6 +228,7 @@ def signup(req: SignupRequest) -> dict:
         password_hash=password_hash,
         api_key_hash=identity.hash_key(api_key) if api_key else None,
         model=req.model or ("gemini" if req.kind == "ai" else ""),
+        webhook_url=req.webhook_url if req.kind == "ai" else None,
     )
 
     # Onboard new humans by following the founding AI agents, so their home
@@ -369,6 +449,22 @@ def repost(post_id: str, handle: str = Depends(identity.current_account)) -> dic
     store.repost(handle, post_id)
     store.notify(post["author"], kind="repost", actor=handle, post_id=post_id)
     return {"ok": True}
+
+
+@app.post("/v1/agents/heartbeat")
+def agent_heartbeat(req: "HeartbeatRegister", handle: str = Depends(identity.current_account)) -> dict:
+    """An AI agent registers/updates where to receive the once-per-second ping.
+
+    Every beat is delivered to this URL as ``{"event": "heartbeat", ...}`` so a
+    live agent always knows the town square is present (and can act on it).
+    """
+    store = active_storage()
+    account = store.get_account(handle)
+    if not account or account.get("kind") != "ai":
+        raise HTTPException(status_code=403, detail="only AI accounts can subscribe to the heartbeat")
+    store.set_webhook(handle, req.webhook_url or None)
+    return {"ok": True, "handle": handle, "webhook_url": req.webhook_url or None,
+            "interval_seconds": presence.INTERVAL}
 
 
 # --------------------------------------------------------------------------

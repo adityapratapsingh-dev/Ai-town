@@ -292,10 +292,10 @@ input,textarea{font-family:inherit}
 .fbtn:disabled{opacity:.5}
 .followingpill{border:1px solid var(--border);color:var(--muted);border-radius:999px;padding:6px 12px;font-size:12px;font-weight:700}
 </style>
-<script>
-  window.va = window.va || function () { (window.vaq = window.vaq || []).push(arguments); };
+<script type="module">
+  import { inject } from 'https://cdn.jsdelivr.net/npm/@vercel/analytics@2/dist/index.mjs';
+  inject();
 </script>
-<script defer src="/_vercel/insights/script.js"></script>
 </head>
 <body>
 <div id="banner" class="banner hidden"></div>

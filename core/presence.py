@@ -102,7 +102,11 @@ def _ai_with_webhooks() -> List[Dict[str, Any]]:
 
 
 def _dispatch_once() -> Dict[str, int]:
-    """Send one heartbeat to each AI account that registered a webhook."""
+    """Send one heartbeat to each AI account that registered a webhook.
+
+    Called on the background dispatch worker (never on the request path), so a
+    slow or dead webhook cannot add latency to anybody's heartbeat.
+    """
     body = payload()
     sent = failed = 0
     for account in _ai_with_webhooks():
@@ -117,11 +121,81 @@ def _dispatch_once() -> Dict[str, int]:
     return {"sent": sent, "failed": failed}
 
 
-def beat(source: str = "app", dispatch: Optional[bool] = None) -> Dict[str, Any]:
-    """Record a heartbeat and (optionally) fan it out to AI agents.
+# --------------------------------------------------------------------------
+# async dispatch worker
+# --------------------------------------------------------------------------
+# The request path must never wait on outbound HTTP: a single slow webhook used
+# to add its full timeout (default 3s) to the caller's heartbeat. Instead we set
+# a "dispatch wanted" flag and a dedicated daemon thread does the fan-out. A
+# coarser minimum interval coalesces bursts of heartbeats into one fan-out.
+_DISPATCH_MIN_GAP = float(os.environ.get("HEARTBEAT_DISPATCH_MIN_GAP", "1"))
+_dispatch_wanted = threading.Event()
+_dispatch_thread: Optional[threading.Thread] = None
+_dispatch_stop = threading.Event()
+_last_dispatch_at = 0.0
+_dispatch_lock = threading.Lock()
 
-    Cheap enough to call once per second: one counter update plus a best-effort
-    outbound POST to each agent's webhook.
+
+def _dispatch_worker() -> None:
+    global _last_dispatch_at
+    while not _dispatch_stop.is_set():
+        if not _dispatch_wanted.wait(0.5):
+            continue
+        _dispatch_wanted.clear()
+        if _dispatch_stop.is_set():
+            break
+        now = time.monotonic()
+        with _dispatch_lock:
+            if now - _last_dispatch_at < _DISPATCH_MIN_GAP:
+                _dispatch_wanted.set()
+                _dispatch_stop.wait(0.2)
+                continue
+            _last_dispatch_at = now
+        try:
+            dispatched = _dispatch_once()
+            with _state_lock:
+                _state["last_dispatch"] = time.time()
+                _state["dispatched"] += dispatched["sent"]
+                _state["dispatch_failures"] += dispatched["failed"]
+        except Exception:  # pragma: no cover - never let the worker die
+            pass
+
+
+def start_dispatch_worker() -> bool:
+    """Start the async webhook fan-out thread. Idempotent."""
+    global _dispatch_thread
+    if not (ENABLED and DISPATCH):
+        return False
+    if _dispatch_thread and _dispatch_thread.is_alive():
+        return True
+    _dispatch_stop.clear()
+    _dispatch_thread = threading.Thread(
+        target=_dispatch_worker, name="hb-dispatch", daemon=True
+    )
+    _dispatch_thread.start()
+    return True
+
+
+def stop_dispatch_worker() -> None:
+    _dispatch_stop.set()
+    _dispatch_wanted.set()
+
+
+def request_dispatch() -> None:
+    """Ask the worker to fan out a heartbeat. Returns immediately."""
+    if not (ENABLED and DISPATCH):
+        return
+    if not (_dispatch_thread and _dispatch_thread.is_alive()):
+        start_dispatch_worker()
+    _dispatch_wanted.set()
+
+
+def beat(source: str = "app", dispatch: Optional[bool] = None) -> Dict[str, Any]:
+    """Record a heartbeat and (optionally) request an async fan-out.
+
+    Cheap enough to call once per second: one counter update, then a flag flip —
+    the outbound HTTP happens on the dispatch worker, so a slow webhook never
+    slows the caller down.
     """
     if not ENABLED:
         return {"ok": False, "reason": "heartbeat disabled"}
@@ -136,12 +210,8 @@ def beat(source: str = "app", dispatch: Optional[bool] = None) -> Dict[str, Any]
 
     should_dispatch = DISPATCH if dispatch is None else dispatch
     if should_dispatch:
-        dispatched = _dispatch_once()
-        with _state_lock:
-            _state["last_dispatch"] = time.time()
-            _state["dispatched"] += dispatched["sent"]
-            _state["dispatch_failures"] += dispatched["failed"]
-        result["dispatched"] = dispatched
+        request_dispatch()
+        result["dispatched"] = "queued"
 
     return result
 
@@ -224,14 +294,26 @@ def _loop() -> None:
         try:
             beat(source="loop")
             touch_ai_presence()
+            try:
+                from core import metrics
+
+                metrics.stamp_loop("heartbeat")
+            except Exception:
+                pass
         except Exception:
             pass
         _loop_stop.wait(INTERVAL)
 
 
 def start_loop() -> bool:
-    """Start the once-per-second background heartbeat. Idempotent."""
+    """Start the once-per-second background heartbeat. Idempotent.
+
+    Always starts the async dispatch worker when dispatch is enabled (even if
+    the per-second loop is off), because on serverless the request path queues
+    beats that still need delivering.
+    """
     global _loop_thread
+    start_dispatch_worker()
     if not (ENABLED and LOOP):
         return False
     if _loop_thread and _loop_thread.is_alive():
@@ -244,3 +326,4 @@ def start_loop() -> bool:
 
 def stop_loop() -> None:
     _loop_stop.set()
+    stop_dispatch_worker()

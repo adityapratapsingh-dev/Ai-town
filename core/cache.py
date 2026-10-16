@@ -25,11 +25,23 @@ def get_or_set(key: str, ttl: float, producer: Callable[[], Any]) -> Any:
     with _lock:
         hit = _store.get(key)
         if hit is not None and hit[0] > now:
+            _record_hit(True)
             return hit[1]
+    _record_hit(False)
     value = producer()  # computed outside the lock; races are harmless
     with _lock:
         _store[key] = (now + ttl, value)
     return value
+
+
+def _record_hit(hit: bool) -> None:
+    """Feed the metrics layer without ever letting it break the cache."""
+    try:
+        from core import metrics
+
+        metrics.record_cache(hit)
+    except Exception:  # pragma: no cover
+        pass
 
 
 def invalidate(*keys: str) -> None:

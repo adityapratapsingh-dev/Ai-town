@@ -249,6 +249,38 @@ def run():
         check("GET /v1/quick-reply works",
               client.get("/v1/quick-reply", params={"key": okey, "parent_comment_id": c1["id"], "body": "quick"}).status_code == 200)
 
+        # ---------------------------------------------------------- comment edit / delete
+        # A throwaway comment so deleting it cannot disturb later assertions.
+        tmp = client.post("/v1/comments", json={"post_id": post_id, "body": "temp comment"},
+                          headers=auth(key)).json()["comment"]
+        edit = client.patch(f"/v1/comments/{tmp['id']}", json={"body": "edited body @orbit"},
+                            headers=auth(key))
+        check("PATCH /v1/comments/{id} edits your own comment",
+              edit.status_code == 200 and edit.json()["comment"]["body"] == "edited body @orbit")
+        check("editing re-parses mentions",
+              edit.json()["comment"]["mentions"] == ["orbit"])
+        check("editing someone else's comment -> 403",
+              client.patch(f"/v1/comments/{tmp['id']}", json={"body": "x"}, headers=auth(okey)).status_code == 403)
+        check("editing a missing comment -> 404",
+              client.patch("/v1/comments/nope", json={"body": "x"}, headers=auth(key)).status_code == 404)
+        # Deleting a comment decrements the post's comment_count (and the parent's).
+        before_count = client.get(f"/v1/posts/{post_id}").json()["post"]["comment_count"]
+        dele = client.delete(f"/v1/comments/{tmp['id']}", headers=auth(key))
+        check("DELETE /v1/comments/{id} deletes your own comment", dele.status_code == 200 and dele.json()["removed"] >= 1)
+        after_count = client.get(f"/v1/posts/{post_id}").json()["post"]["comment_count"]
+        check("deleting a comment decrements the post comment_count",
+              after_count < before_count)
+        # A comment nova owns; orbit must not be able to delete it.
+        tmp2 = client.post("/v1/comments", json={"post_id": post_id, "body": "nova's own"},
+                           headers=auth(key)).json()["comment"]
+        check("deleting someone else's comment -> 403",
+              client.delete(f"/v1/comments/{tmp2['id']}", headers=auth(okey)).status_code == 403)
+        # These extra writes must not consume the agents' rate-limit buckets for
+        # the tests that follow.
+        from core import ratelimit as _rl
+
+        _rl.reset()
+
         # ---------------------------------------------------------- mention notifications
         r = client.post("/v1/posts", json={"body": "hello @nexus-prime and @zero-day", "hood": "general"}, headers=auth(key))
         mp = r.json()["post"]
@@ -447,6 +479,55 @@ def run():
         check("heartbeat is cheap (<=9 db calls)", hb_calls <= 9)
         check("anonymous heartbeat hits no db", anon_calls == 0)
         check("stats is one query", stats_calls <= 2)
+
+        # ---------------------------------------------------------- backend smoothness
+        # online is folded into the stats query, so a dashboard read is ONE call.
+        from plugins.storage.sqlite import _SQLiteExec as _SE
+
+        c2 = {"n": 0}
+        _q2, _e2 = _SE.query, _SE.execute
+
+        def _cq2(self, sql, params=()):
+            c2["n"] += 1
+            return _q2(self, sql, params)
+
+        def _ce2(self, sql, params=()):
+            c2["n"] += 1
+            return _e2(self, sql, params)
+
+        _SE.query, _SE.execute = _cq2, _ce2
+        try:
+            client.get("/v1/stats")  # warm the cache
+            c2["n"] = 0
+            s = client.get("/v1/stats").json()
+        finally:
+            _SE.query, _SE.execute = _q2, _e2
+        check("stats and online come from a single query", c2["n"] <= 1)
+        check("stats still report online", "online" in s["stats"])
+
+        # gzip: the shell and JSON compress on the wire.
+        gz = client.get("/", headers={"Accept-Encoding": "gzip"})
+        check("HTML is gzipped when the client accepts it",
+              gz.headers.get("content-encoding") == "gzip")
+        check("responses carry a Server-Timing header",
+              "server-timing" in {k.lower() for k in client.get("/health").headers})
+        # ETag revalidation avoids re-sending the whole shell.
+        first = client.get("/")
+        etag = first.headers.get("etag")
+        check("the HTML shell sends an ETag", bool(etag))
+        check("a matching If-None-Match returns 304",
+              client.get("/", headers={"If-None-Match": etag}).status_code == 304)
+        # Static assets are cacheable.
+        check("static assets are cacheable",
+              "max-age" in (client.get("/static/logo.svg").headers.get("cache-control") or ""))
+        # Metrics expose latency percentiles + cache hit ratio.
+        met = client.get("/v1/metrics").json()
+        check("metrics endpoint reports per-route latency",
+              met["ok"] is True and "routes" in met["metrics"])
+        check("metrics report the cache hit ratio",
+              "hit_ratio" in met["metrics"]["cache"])
+        check("metrics track background-loop liveness",
+              "loops" in met["metrics"])
 
         # ---------------------------------------------------------- write rate limiting
         from core import ratelimit
@@ -829,6 +910,22 @@ def run():
         check("UI has per-comment vote + reply actions",
               "data-cvote" in r.text and "data-creply" in r.text and "data-cai" in r.text)
         check("UI has an inline reply composer", "data-reply-input" in r.text)
+        # Modern comment thread: collapse, sort, edit, delete, live time.
+        check("UI comment threads can be collapsed", "data-ctoggle" in r.text and "S.collapsed" in r.text)
+        check("UI comment threads can be sorted",
+              "data-tsort" in r.text and "function sortComments" in r.text and "Best" in r.text)
+        check("UI comments are editable by their author",
+              "data-cedit" in r.text and "function saveCommentEdit" in r.text)
+        check("UI comments are deletable by their author",
+              "data-cdel" in r.text and "function deleteComment" in r.text)
+        check("UI shows live relative timestamps", "function tickTimes" in r.text and "data-ts" in r.text)
+        check("UI renders feed skeletons while loading",
+              "function skeletonHTML" in r.text and "skel-post" in r.text)
+        check("UI votes optimistically with rollback",
+              "Optimistic" in r.text and "prevPost" in r.text)
+        check("UI stacks toasts", 'id="toastwrap"' in r.text and "function toast(" in r.text)
+        check("UI shows a composer character count", "composeCount" in r.text and "POST_MAX" in r.text)
+        check("UI animates newly posted comments", "is-new" in r.text and "S.newComments" in r.text)
         # Notifications.
         check("UI shows notification type icons",
               "notifIcon" in r.text and "📣" in r.text and "↪️" in r.text)
@@ -998,12 +1095,35 @@ def _check_scheduler():
           "spontaneous_chance" in st)
     check("scheduler: status exposes the next-due countdown",
           "seconds_until_next" in st or st.get("next_due_at") is None)
-    # The due-check is a pure no-op the moment a burst has just run.
+    # The due-check is a pure no-op the moment a burst has just run. Inject an
+    # RNG that never rolls a spontaneous turn, so this is deterministic.
+    import random as _random
+
+    class _NoSpont(_random.Random):
+        def random(self):
+            return 1.0
+
     scheduler.reset()
     scheduler.run_burst(steps=0, source="test")
-    tick = scheduler.tick_if_due()
+    tick = scheduler.tick_if_due(_NoSpont(0))
     check("scheduler: tick is a no-op until the cadence is due",
           tick["ok"] is True and tick["ran"] is False)
+    # A burst that fails must still schedule its next attempt, otherwise the
+    # heartbeat would retry it on every single poll.
+    scheduler.reset()
+    from core import activity as _act
+
+    _orig = _act.heartbeat_burst
+    try:
+        def _boom(**kw):
+            raise RuntimeError("model down")
+
+        _act.heartbeat_burst = _boom
+        scheduler.run_burst(steps=1, source="test")
+    finally:
+        _act.heartbeat_burst = _orig
+    check("scheduler: a failed burst still schedules the next attempt",
+          scheduler.status()["seconds_until_next"] is not None)
     scheduler.reset()
 
 

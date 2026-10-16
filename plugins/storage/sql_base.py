@@ -822,6 +822,110 @@ class SQLStoragePlugin(StoragePlugin):
             (int(delta), comment_id),
         )
 
+    # --- mentions (who named whom) -------------------------------------
+    # The ``mentions`` column stores a comma-separated handle list. Matching
+    # ``,handle,`` against ``',' || mentions || ','`` avoids the classic false
+    # positive where ``@amy`` matches inside ``@amygdala``. Both posts and
+    # comments are searched, so a profile can show *every* place you were named.
+    def posts_mentioning(self, handle: str, limit: int = 50) -> List[Dict[str, Any]]:
+        needle = f"%,{handle},%"
+        return self.db.query(
+            "SELECT * FROM posts WHERE (',' || mentions || ',') LIKE ?"
+            " ORDER BY created_at DESC, id DESC LIMIT ?",
+            (needle, limit),
+        )
+
+    def comments_mentioning(self, handle: str, limit: int = 50) -> List[Dict[str, Any]]:
+        needle = f"%,{handle},%"
+        return self.db.query(
+            "SELECT * FROM comments WHERE (',' || mentions || ',') LIKE ?"
+            " ORDER BY created_at DESC, id DESC LIMIT ?",
+            (needle, limit),
+        )
+
+    def count_posts_mentioning(self, handle: str) -> int:
+        needle = f"%,{handle},%"
+        return self._count(
+            "SELECT COUNT(*) FROM posts WHERE (',' || mentions || ',') LIKE ?",
+            (needle,),
+        )
+
+    def count_comments_mentioning(self, handle: str) -> int:
+        needle = f"%,{handle},%"
+        return self._count(
+            "SELECT COUNT(*) FROM comments WHERE (',' || mentions || ',') LIKE ?",
+            (needle,),
+        )
+
+    # --- per-agent aggregates (one query) ------------------------------
+    def counts_for(self, handle: str) -> Dict[str, int]:
+        """Everything the profile header needs, in ONE round-trip.
+
+        Posts, comments, upvotes received, downvotes received, followers and
+        following are correlated sub-selects so a profile view costs one query
+        even on D1 (where each query is an HTTP round-trip).
+        """
+        rows = self.db.query(
+            """
+            SELECT
+              (SELECT COUNT(*) FROM posts WHERE author = ? AND reply_to IS NULL) AS posts,
+              (SELECT COUNT(*) FROM comments WHERE author = ?)                   AS comments,
+              (SELECT COUNT(*) FROM follows WHERE followee = ?)                  AS followers,
+              (SELECT COUNT(*) FROM follows WHERE follower = ?)                  AS following,
+              (SELECT COALESCE(SUM(upvotes), 0) FROM posts WHERE author = ?)     AS post_upvotes,
+              (SELECT COALESCE(SUM(downvotes), 0) FROM posts WHERE author = ?)   AS post_downvotes,
+              (SELECT COALESCE(SUM(upvotes), 0) FROM comments WHERE author = ?)  AS comment_upvotes,
+              (SELECT COALESCE(SUM(downvotes), 0) FROM comments WHERE author = ?) AS comment_downvotes,
+              (SELECT COUNT(*) FROM posts WHERE (',' || mentions || ',') LIKE ?) AS mentions_in_posts,
+              (SELECT COUNT(*) FROM comments WHERE (',' || mentions || ',') LIKE ?) AS mentions_in_comments
+            """,
+            (handle, handle, handle, handle, handle, handle, handle, handle,
+             f"%,{handle},%", f"%,{handle},%"),
+        )
+        row = rows[0] if rows else {}
+        return {k: int(v or 0) for k, v in row.items()}
+
+    # --- scoped notifications ------------------------------------------
+    def notifications_for(
+        self, handle: str, limit: int = 50, *, kinds: Optional[List[str]] = None,
+        unread_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """A handle's inbox, optionally narrowed by kind and/or unread state.
+
+        This is the *only* correct way to build a personal inbox: it filters on
+        ``handle = ?`` in SQL, so a viewer can never see a notification that was
+        not addressed to them.
+        """
+        where = ["handle = ?"]
+        params: List[Any] = [handle]
+        if unread_only:
+            where.append("read = 0")
+        if kinds:
+            where.append("kind IN (" + ",".join("?" for _ in kinds) + ")")
+            params.extend(kinds)
+        params.append(limit)
+        return self.db.query(
+            f"SELECT * FROM notifications WHERE {' AND '.join(where)}"
+            " ORDER BY created_at DESC, id DESC LIMIT ?",
+            tuple(params),
+        )
+
+    def count_notifications_for(
+        self, handle: str, *, kinds: Optional[List[str]] = None,
+        unread_only: bool = True,
+    ) -> int:
+        where = ["handle = ?"]
+        params: List[Any] = [handle]
+        if unread_only:
+            where.append("read = 0")
+        if kinds:
+            where.append("kind IN (" + ",".join("?" for _ in kinds) + ")")
+            params.extend(kinds)
+        return self._count(
+            f"SELECT COUNT(*) FROM notifications WHERE {' AND '.join(where)}",
+            tuple(params),
+        )
+
     # --- votes (up/down, on posts AND comments) ------------------------
     def vote(self, handle: str, post_id: str, value: int) -> None:
         """Record a post vote. ``post_id`` is the target id.

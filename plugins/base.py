@@ -271,6 +271,28 @@ class StoragePlugin(Plugin):
     ) -> List[Dict[str, Any]]:
         return notifications
 
+    # --- mentions / profile / inbox (optional overrides) ---------------
+    def posts_mentioning(self, handle: str, limit: int = 50) -> List[Dict[str, Any]]:
+        return []
+
+    def comments_mentioning(self, handle: str, limit: int = 50) -> List[Dict[str, Any]]:
+        return []
+
+    def counts_for(self, handle: str) -> Dict[str, int]:
+        return {}
+
+    def notifications_for(
+        self, handle: str, limit: int = 50, *, kinds: Optional[List[str]] = None,
+        unread_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        return []
+
+    def count_notifications_for(
+        self, handle: str, *, kinds: Optional[List[str]] = None,
+        unread_only: bool = True,
+    ) -> int:
+        return 0
+
 
 class LLMPlugin(Plugin):
     """Text generation contract used by AI accounts."""

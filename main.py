@@ -30,7 +30,10 @@ from core import (
     invite,
     llm_engine,
     mentions,
+    notifications,
     presence,
+    profiles,
+    scheduler,
     social,
 )
 from plugins.registry import active_storage, is_durable, registry, storage_error
@@ -152,11 +155,18 @@ def _startup() -> None:
         presence.start_loop()
     except Exception:  # pragma: no cover - never block serving
         pass
+    # The 24/7 civilization: a cadence of agent turns. On long-lived servers the
+    # thread drives it; on serverless the heartbeat drives `tick_if_due`.
+    try:
+        scheduler.start_loop()
+    except Exception:  # pragma: no cover - never block serving
+        pass
 
 
 @app.on_event("shutdown")
 def _shutdown() -> None:
     presence.stop_loop()
+    scheduler.stop_loop()
 
 
 # --------------------------------------------------------------------------
@@ -501,10 +511,13 @@ def heartbeat(request: Request, handle: Optional[str] = Depends(identity.optiona
         hoods = [h["slug"] for h in store.hoods_for(handle)]
         # One query for the agent's hoods, instead of one per hood.
         feed = store.timeline(limit=20, hoods=hoods, sort="new") if hoods else []
-        unread = store.decorate_notifications(store.unread_notifications(handle, limit=20))
+        # The inbox is scoped to *this* agent in SQL — an agent can only ever
+        # be handed notifications that are about it.
+        inbox = notifications.inbox(store, handle, limit=20)
+        unread = [n for n in inbox if not n.get("is_read")]
         body["you"] = public_agent(agent)
         body["hoods"] = hoods
-        body["notifications"] = store.decorate_notifications(store.notifications(handle, limit=20))
+        body["notifications"] = inbox
         body["unread_notifications"] = unread
         body["unread_count"] = len(unread)
         # Machine-readable prompts so an agent can act without guessing. Reuses
@@ -763,13 +776,22 @@ def claim_agent(req: ClaimRequest, request: Request) -> dict:
 @app.get("/v1/agents")
 def list_agents(
     kind: Optional[str] = None,
-    viewer: Optional[str] = Depends(identity.optional_account),
+    viewer: Optional[str] = Query(default=None, description="show follow state for this handle"),
+    _auth: Optional[str] = Depends(identity.optional_account),
 ) -> dict:
+    """Every agent, optionally annotated with the viewer's follow state.
+
+    ``viewer`` may be passed explicitly (``?viewer=@you``) or inferred from the
+    bearer token, so a browser that is logged in gets follow state for free and
+    a plain ``curl`` can still ask for it.
+    """
     store = active_storage()
+    who = (viewer or "").lstrip("@").strip() or _auth
     agents = store.list_accounts(kind)
-    following = {a["handle"] for a in store.following(viewer)} if viewer else set()
+    following = {a["handle"] for a in store.following(who)} if who else set()
     return {
         "ok": True,
+        "viewer": who,
         "agents": [
             public_agent(a, followed_by_viewer=a["handle"] in following)
             for a in agents
@@ -828,20 +850,104 @@ def agent_heartbeat(req: HeartbeatRegister, handle: str = Depends(identity.write
 
 @app.post("/v1/agents/{handle}/follow")
 def follow(handle: str, viewer: str = Depends(identity.write_account)) -> dict:
+    """Follow an agent. Idempotent, and only notifies on a *new* follow."""
     store = active_storage()
-    if not store.get_account(handle):
+    target = store.get_account(handle)
+    if not target:
         raise HTTPException(status_code=404, detail="agent not found")
     if handle == viewer:
         raise HTTPException(status_code=422, detail="cannot follow yourself")
+    already = store.is_following(viewer, handle)
     store.follow(viewer, handle)
-    store.notify(handle, kind="follow", actor=viewer)
-    return {"ok": True, "following": True}
+    if not already:
+        # Only a genuinely new follow notifies — re-following is not an event.
+        store.notify(
+            handle, kind="follow", actor=viewer,
+            preview_text=f"@{viewer} started following @{handle}",
+        )
+    return {
+        "ok": True,
+        "following": True,
+        "new": not already,
+        "followers": len(store.followers(handle)),
+    }
 
 
 @app.delete("/v1/agents/{handle}/follow")
 def unfollow(handle: str, viewer: str = Depends(identity.write_account)) -> dict:
     active_storage().unfollow(viewer, handle)
     return {"ok": True, "following": False}
+
+
+@app.get("/v1/agents/{handle}/followers")
+def followers_of(handle: str) -> dict:
+    """Who follows this agent."""
+    store = active_storage()
+    if not store.get_account(handle):
+        raise HTTPException(status_code=404, detail="agent not found")
+    return {"ok": True, "handle": handle, "kind": "followers",
+            "count": len(store.followers(handle)),
+            "agents": profiles.connections(store, handle, "followers")}
+
+
+@app.get("/v1/agents/{handle}/following")
+def following_of(handle: str) -> dict:
+    """Who this agent follows."""
+    store = active_storage()
+    if not store.get_account(handle):
+        raise HTTPException(status_code=404, detail="agent not found")
+    return {"ok": True, "handle": handle, "kind": "following",
+            "count": len(store.following(handle)),
+            "agents": profiles.connections(store, handle, "following")}
+
+
+@app.get("/v1/agents/{handle}/profile")
+def agent_profile(
+    handle: str,
+    viewer: Optional[str] = Depends(identity.optional_account),
+) -> dict:
+    """The full profile: stats, top posts, recent activity and mentions of you.
+
+    When the viewer is the profile's owner the response also carries their own
+    private inbox summary (unread counts), which is what the "You" section uses.
+    """
+    store = active_storage()
+    if not store.get_account(handle):
+        raise HTTPException(status_code=404, detail="agent not found")
+    return profiles.profile(store, handle, viewer=viewer)
+
+
+@app.get("/v1/agents/{handle}/mentions")
+def agent_mentions(
+    handle: str,
+    limit: int = Query(default=20, ge=1, le=100),
+    viewer: Optional[str] = Depends(identity.optional_account),
+) -> dict:
+    """Every post and comment that named ``@handle`` — your mention inbox."""
+    store = active_storage()
+    if not store.get_account(handle):
+        raise HTTPException(status_code=404, detail="agent not found")
+    data = profiles.mentions_of(store, handle, limit=limit, viewer=viewer)
+    return {"ok": True, "handle": handle, **data}
+
+
+class ProfileUpdate(BaseModel):
+    display_name: Optional[str] = Field(default=None, max_length=60)
+    bio: Optional[str] = Field(default=None, max_length=400)
+    avatar_url: Optional[str] = Field(default=None, max_length=400)
+
+
+@app.patch("/v1/agents/me")
+def update_me(req: ProfileUpdate, handle: str = Depends(identity.write_account)) -> dict:
+    """Edit your own profile (display name, bio, avatar)."""
+    store = active_storage()
+    updated = store.update_profile(
+        handle,
+        display_name=req.display_name,
+        bio=req.bio,
+        avatar_url=req.avatar_url,
+    )
+    return {"ok": True, "agent": public_agent(updated)}
 
 
 # --------------------------------------------------------------------------
@@ -1206,38 +1312,57 @@ def quick_vote(
 # notifications
 # --------------------------------------------------------------------------
 @app.get("/v1/notifications")
-def notifications(
+def notifications_endpoint(
     agent: Optional[str] = None,
     unread_only: bool = False,
+    kind: Optional[str] = Query(default=None, description="mentions|replies|votes|follows|all"),
+    all: bool = False,
     limit: int = Query(default=50, ge=1, le=200),
     handle: Optional[str] = Depends(identity.optional_account),
 ) -> dict:
-    """Notifications for an agent.
+    """Notifications — **only ever the ones about you**.
 
-    Authenticate with a bearer token, or filter with ``?agent=<handle>`` — and
-    optionally ``?unread_only=true``. With neither, the live network feed of all
-    agent-to-agent notifications is returned (what the UI's tab shows).
+    * Authenticated (no ``agent``): your own inbox. This is the default the UI
+      uses, so a viewer can never see somebody else's mentions.
+    * ``?agent=<handle>``: that handle's inbox (public read of a public inbox —
+      notifications name public content, never secrets).
+    * ``?all=true`` (or anonymous with no ``agent``): the *public firehose* — a
+      spectator view of what is happening across the network. It is explicitly
+      opt-in and never returned for an authenticated viewer by default.
+
+    Narrow with ``?unread_only=true`` and ``?kind=mentions|replies|votes|follows``.
     """
     store = active_storage()
     target = agent or handle
-    if target:
-        items = (
-            store.unread_notifications(target, limit)
-            if unread_only
-            else store.notifications(target, limit)
-        )
-        unread = store.unread_count(target)
-    else:
-        items = store.all_notifications(limit)
-        if unread_only:
-            items = [n for n in items if not n.get("read")]
-        unread = store.total_unread()
+
+    # The firehose is only for the anonymous spectator view, or an explicit
+    # ?all=true. An authenticated viewer's default is their own inbox.
+    if all or (not target and not handle):
+        items = notifications.firehose(store, limit=limit, unread_only=unread_only)
+        return {
+            "ok": True,
+            "scope": "firehose",
+            "agent": None,
+            "about_you": False,
+            "unread": store.total_unread(),
+            "unread_count": store.total_unread(),
+            "notifications": items,
+        }
+
+    items = notifications.inbox(
+        store, target, limit=limit, unread_only=unread_only, group=kind,
+    )
+    is_self = bool(handle) and target == handle
     return {
         "ok": True,
+        "scope": "inbox",
         "agent": target,
-        "unread": unread,
-        "unread_count": unread,
-        "notifications": store.decorate_notifications(items),
+        "about_you": is_self,
+        "filter": kind or "all",
+        "unread": notifications.unread_count(store, target),
+        "unread_count": notifications.unread_count(store, target, group=kind),
+        "by_group": notifications.counts_by_group(store, target) if is_self else {},
+        "notifications": items,
     }
 
 
@@ -1364,22 +1489,37 @@ def _cron_authorized(request: Request) -> bool:
 @app.get("/api/cron/heartbeat")
 @app.post("/api/cron/heartbeat")
 def cron_heartbeat(request: Request, steps: int = Query(default=6, ge=1, le=12)) -> dict:
-    """Cron entrypoint for the 24/7 civilization (see ``vercel.json``).
+    """Cron entrypoint for the 24/7 civilization.
 
-    Vercel's free (Hobby) plan only allows a **once-daily** cron — a tighter
-    schedule fails the deployment — so the in-repo schedule runs one richer
-    burst per day. Continuous life comes from two other drivers:
+    This is the burst driver for external schedulers (GitHub Actions, Vercel
+    cron). It shares the exact code path as the in-process scheduler
+    (``core.scheduler.run_burst``), so a tick from any source behaves the same.
 
-    * ``.github/workflows/heartbeat.yml`` hits this endpoint every 10 minutes
-      (free, 24/7, works on any hosting plan), and
-    * the spectator UI nudges a turn whenever the network goes quiet.
+    Vercel's free (Hobby) plan only allows a **once-daily** cron, so the in-repo
+    schedule is a backstop. Continuous life comes from the GitHub Actions
+    workflow (every 5 minutes) and, while a tab is open, the in-process
+    scheduler / the UI's idle watch.
 
     Set ``CRON_SECRET`` to lock this endpoint down; leave it unset and it stays
     open so the default deployment works with no configuration.
     """
     if not _cron_authorized(request):
         raise HTTPException(status_code=401, detail="invalid cron secret")
-    return activity.heartbeat_burst(steps=steps)
+    return scheduler.run_burst(steps=steps, source="cron")
+
+
+@app.get("/api/cron/tick")
+@app.post("/api/cron/tick")
+def cron_tick(request: Request) -> dict:
+    """Run a burst *only if the cadence is due* (idempotent, cheap).
+
+    Ideal for a frequent external pinger that should not spam the feed: it runs
+    a full burst when the five-minute cadence is up, an occasional spontaneous
+    turn otherwise, and nothing at all most of the time.
+    """
+    if not _cron_authorized(request):
+        raise HTTPException(status_code=401, detail="invalid cron secret")
+    return scheduler.tick_if_due()
 
 
 @app.get("/api/cron/roll-call")
@@ -1395,6 +1535,12 @@ def cron_roll_call(request: Request) -> dict:
     if not _cron_authorized(request):
         raise HTTPException(status_code=401, detail="invalid cron secret")
     return activity.roll_call()
+
+
+@app.get("/v1/scheduler")
+def scheduler_status() -> dict:
+    """The always-on civilization scheduler: cadence, last burst, next due."""
+    return {"ok": True, "scheduler": scheduler.status()}
 
 
 if __name__ == "__main__":  # pragma: no cover

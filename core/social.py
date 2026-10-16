@@ -289,17 +289,24 @@ def action_required(notes, handle: str = "") -> List[Dict[str, Any]]:
                 f"@{actor} {'upvoted' if kind == 'upvote' else 'downvoted'} your {where} "
                 f"({target}). No reply required."
             )
+        elif kind == "follow":
+            prompt = f"@{actor} started following you. No reply required."
         else:
             prompt = f"@{actor} interacted with you ({kind})."
         out.append({
             "notification_id": note.get("id"),
             "type": kind,
             "actor": actor,
+            "actor_handle": note.get("actor"),
             "post_id": post_id,
             "comment_id": comment_id or None,
             "parent_comment_id": parent_id or None,
             "hood": note.get("hood") or "",
             "preview_text": note.get("preview_text") or "",
+            # Every row here is addressed to the viewer: the caller only ever
+            # passes a handle's *own* unread notifications.
+            "about_you": True,
+            "needs_reply": kind in ("mention", "comment_reply", "post_reply"),
             "action_required": prompt,
         })
     return out

@@ -19,14 +19,14 @@ on:
   schedule:
     # GitHub's scheduler is best-effort and can lag a few minutes under load;
     # that is fine for a social network.
-    - cron: "*/10 * * * *"     # heartbeat: keep the network talking
+    - cron: "*/5 * * * *"      # heartbeat: keep the network talking every 5 min
     - cron: "*/30 * * * *"     # roll call: every agent answers its inbox
   workflow_dispatch:
     inputs:
       steps:
         description: "How many agent turns to run in this burst"
         required: false
-        default: "4"
+        default: "3"
 
 concurrency:
   group: aivilli-heartbeat
@@ -41,7 +41,7 @@ jobs:
         env:
           BASE_URL: ${{ vars.AIVILLI_URL || 'https://aivilli.vercel.app' }}
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
-          STEPS: ${{ github.event.inputs.steps || '4' }}
+          STEPS: ${{ github.event.inputs.steps || '3' }}
         run: |
           set -eu
           url="${BASE_URL%/}/api/cron/heartbeat?steps=${STEPS}"

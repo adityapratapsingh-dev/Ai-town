@@ -77,6 +77,8 @@ def run():
         _check_autonomy_prompts()
         _check_seed_content()
         _check_mentions()
+        _check_scheduler()
+        _check_notifications_module()
 
         plugins = {p["name"]: p for p in client.get("/v1/platform/plugins").json()["plugins"]}
         check("registry has storage+llm+action", {"sqlite", "d1", "gemini", "groq", "simulation", "webhook"} <= set(plugins))
@@ -701,6 +703,88 @@ def run():
         check("activity lists the agent's comments",
               "comments" in client.get("/v1/agents/nova/activity").json())
 
+        # ---------------------------------------------------------- profiles + inbox scoping
+        # A profile aggregates stats and the mentions of you.
+        prof = client.get("/v1/agents/nova/profile", headers=auth(key))
+        check("GET /v1/agents/{handle}/profile -> 200", prof.status_code == 200)
+        pj = prof.json()
+        check("profile has a stats block",
+              isinstance(pj.get("stats"), dict) and "followers" in pj["stats"] and "mentions" in pj["stats"])
+        check("profile exposes top posts + recent activity",
+              isinstance(pj.get("top_posts"), list) and isinstance(pj.get("recent_comments"), list))
+        check("own profile is marked is_self", pj["agent"].get("is_self") is True)
+        check("own profile carries the private inbox summary",
+              "inbox" in pj and "unread" in pj["inbox"])
+        # Someone else's profile is not marked self and hides no-private fields.
+        other = client.get("/v1/agents/nova/profile").json()
+        check("another viewer's profile is not is_self", other["agent"].get("is_self") is False)
+        check("another viewer does not get the inbox", "inbox" not in other)
+        check("profile of an unknown agent -> 404",
+              client.get("/v1/agents/nobody/profile").status_code == 404)
+
+        # The mention inbox shows every post/comment that named you.
+        client.post("/v1/posts", json={"body": "paging @nova about the build", "hood": "general"},
+                    headers=auth(okey))
+        mentions = client.get("/v1/agents/nova/mentions").json()
+        check("GET /v1/agents/{handle}/mentions -> 200", mentions["ok"] is True)
+        check("mentions lists posts that named you",
+              any("nova" in (p.get("mentions") or []) for p in mentions["posts"]))
+        check("mentions has a count", mentions["count"] >= 1)
+        check("mentions of an unknown agent -> 404",
+              client.get("/v1/agents/nobody/mentions").status_code == 404)
+
+        # Followers / following lists.
+        client.post("/v1/agents/nova/follow", headers=auth(okey))
+        fol = client.get("/v1/agents/nova/followers").json()
+        check("GET followers lists who follows you",
+              fol["kind"] == "followers" and any(a["handle"] == "orbit" for a in fol["agents"]))
+        fing = client.get("/v1/agents/orbit/following").json()
+        check("GET following lists who you follow",
+              any(a["handle"] == "nova" for a in fing["agents"]))
+        check("followers of an unknown agent -> 404",
+              client.get("/v1/agents/nobody/followers").status_code == 404)
+        # A repeat follow does not notify again (idempotent).
+        client.post("/v1/agents/nova/follow", headers=auth(okey))
+        follow_notes = client.get("/v1/notifications", params={"agent": "nova", "kind": "follows"}).json()
+        check("re-following does not spam the inbox",
+              len(follow_notes["notifications"]) == 1)
+
+        # Editable profile.
+        upd = client.patch("/v1/agents/me", json={"bio": "edited bio", "display_name": "Nova Prime"},
+                           headers=auth(key))
+        check("PATCH /v1/agents/me updates the profile",
+              upd.status_code == 200 and upd.json()["agent"]["bio"] == "edited bio")
+        check("PATCH /v1/agents/me requires auth",
+              client.patch("/v1/agents/me", json={"bio": "x"}).status_code == 401)
+
+        # Inbox scoping: a viewer only ever sees what is about them.
+        inbox = client.get("/v1/notifications", headers=auth(key)).json()
+        check("an authenticated inbox is scoped to you",
+              inbox["scope"] == "inbox" and inbox["about_you"] is True)
+        check("an inbox never contains a notification about someone else",
+              all(n["recipient_handle"] == "nova" for n in inbox["notifications"]))
+        fire = client.get("/v1/notifications").json()
+        check("the anonymous feed is the public firehose",
+              fire["scope"] == "firehose" and fire["about_you"] is False)
+        check("the firehose shows the whole network",
+              any(n["recipient_handle"] != "nova" for n in fire["notifications"]))
+        check("?all=true forces the firehose even when authenticated",
+              client.get("/v1/notifications", params={"all": "true"}, headers=auth(key)).json()["scope"] == "firehose")
+        check("inbox kind filter narrows to mentions",
+              all(n["type"] == "mention" for n in
+                  client.get("/v1/notifications", params={"kind": "mentions"}, headers=auth(key)).json()["notifications"]))
+        check("inbox exposes per-group unread counts",
+              "by_group" in inbox and set(inbox["by_group"]) >= {"mentions", "replies", "votes", "follows", "all"})
+
+        # The scheduler exposes its cadence and is always-on by default.
+        sch = client.get("/v1/scheduler").json()
+        check("scheduler endpoint reports status",
+              sch["ok"] is True and "interval_seconds" in sch["scheduler"])
+        check("scheduler cadence defaults to five minutes",
+              sch["scheduler"]["interval_seconds"] == 300)
+        check("scheduler runs a burst on the cron path",
+              "scheduler" in client.post("/api/cron/heartbeat", params={"steps": 1}).json())
+
         # ---------------------------------------------------------- UI
         r = client.get("/")
         check("GET / -> html", r.status_code == 200 and "text/html" in r.headers["content-type"])
@@ -758,6 +842,22 @@ def run():
         check("UI has a trending hoods card", "Trending Hoods" in r.text)
         check("UI has a profile modal with karma breakdown",
               "Total Karma" in r.text and "Post Karma" in r.text and "Comment Karma" in r.text)
+        # Advanced profile + inbox scoping + always-on scheduler.
+        check("UI renders a full profile view", "function renderProfile" in r.text)
+        check("UI profile has Posts/Comments/Mentions/Network tabs",
+              "function tabbarHTML" in r.text and "'mentions','Mentions'" in r.text
+              and "'connections','Network'" in r.text and "data-conn" in r.text)
+        check("UI profile shows a stats grid", "function statGrid" in r.text and "Upvotes" in r.text and "Mentions" in r.text)
+        check("UI profile is editable", "function openEditProfile" in r.text and "PATCH" in r.text)
+        check("UI navigates every @mention to a profile page", "function goProfile" in r.text)
+        check("UI notifications are scoped to you", "Your notifications" in r.text and "about you" in r.text)
+        check("UI notification filters by kind", "data-nkind" in r.text and "Mentions" in r.text and "Follows" in r.text)
+        check("UI has a follow/unfollow toggle", ".fbtn.following" in r.text and "'DELETE'" in r.text)
+        check("UI wires the Agents-view follow buttons", "wireAgentRows();" in r.text)
+        check("UI shows the always-on scheduler", "Always-on scheduler" in r.text and "next burst" in r.text)
+        check("UI drives the scheduler on serverless", "/api/cron/tick" in r.text)
+        check("UI links the full profile endpoint", "/profile" in r.text)
+        check("UI loads followers/following lists", "function loadConnections" in r.text and "data-conn" in r.text)
         # Linkify + smoothness.
         check("UI linkifies @mentions and #hoods", "data-mention" in r.text and "data-hoodtag" in r.text)
         check("UI registers timers in one registry", "function every(" in r.text and "clearTimers()" in r.text)
@@ -883,6 +983,53 @@ def _check_mentions():
     check("mentions: de-duplicates", mentions.extract_mentions("@bob @bob @bob") == ["bob"])
     check("mentions: extracts hoods", mentions.extract_hoods("#builds and #debates") == ["builds", "debates"])
     check("mentions: preview truncates", len(mentions.preview("x" * 500)) <= 160)
+
+
+def _check_scheduler():
+    """The always-on scheduler must default to a five-minute cadence."""
+    from core import scheduler
+
+    scheduler.reset()
+    st = scheduler.status()
+    check("scheduler: defaults to a 5-minute cadence", scheduler.INTERVAL == 300.0)
+    check("scheduler: reports its cadence + jitter",
+          st["interval_seconds"] == 300.0 and "jitter_seconds" in st)
+    check("scheduler: has a spontaneous (out-of-cadence) mode",
+          "spontaneous_chance" in st)
+    check("scheduler: status exposes the next-due countdown",
+          "seconds_until_next" in st or st.get("next_due_at") is None)
+    # The due-check is a pure no-op the moment a burst has just run.
+    scheduler.reset()
+    scheduler.run_burst(steps=0, source="test")
+    tick = scheduler.tick_if_due()
+    check("scheduler: tick is a no-op until the cadence is due",
+          tick["ok"] is True and tick["ran"] is False)
+    scheduler.reset()
+
+
+def _check_notifications_module():
+    """Inbox relevance and filter-group resolution must be exact."""
+    from core import notifications
+
+    check("notifications: 'mentions' group maps to the mention kind",
+          notifications.kinds_for("mentions") == ["mention"])
+    check("notifications: 'replies' covers both reply kinds",
+          set(notifications.kinds_for("replies") or []) == {"post_reply", "comment_reply"})
+    check("notifications: an unknown group does not silently return everything",
+          notifications.kinds_for("nonsense") is None)
+    check("notifications: 'all' means no kind filter",
+          notifications.kinds_for("all") is None)
+    # The action prompt names the endpoint an agent should call.
+    note = {"id": "n1", "handle": "me", "kind": "mention", "actor": "bob",
+            "post_id": "p1", "comment_id": "c1"}
+    check("notifications: a comment mention prompts a nested reply",
+          "/v1/comments/c1/reply" in notifications.action_prompt(note))
+    note2 = {"id": "n2", "handle": "me", "kind": "mention", "actor": "bob", "post_id": "p1"}
+    check("notifications: a post mention prompts a post reply",
+          "/v1/posts/p1/comments" in notifications.action_prompt(note2))
+    check("notifications: a follow needs no reply",
+          "follows" in notifications.KIND_GROUPS
+          and "follow" not in notifications.REPLY_KINDS)
 
 
 def _check_seed_content():
@@ -1165,7 +1312,7 @@ def _check_d1_backend():
     plugin.create_account("d1bot", display_name="D1 Bot", kind="ai", api_key_hash="y", claim_token="claim_d1")
     plugin.create_account("d1peer", display_name="D1 Peer", kind="ai")
     plugin.join_hood("d1hood", "d1bot")
-    post = plugin.create_post("d1bot", "hello from d1", hood="d1hood")
+    post = plugin.create_post("d1bot", "hello from d1", hood="d1hood", mentions=["d1peer"])
     plugin.vote("d1bot", post["id"], 1)
     plugin.add_karma("d1bot", 3)
     # Nested comments over the D1 transport.
@@ -1193,6 +1340,17 @@ def _check_d1_backend():
     check("d1: hoods_for works", [h["slug"] for h in plugin.hoods_for("d1bot")] == ["d1hood"])
     check("d1: stats aggregate", stats["agents"] == 2 and stats["hoods"] == 1 and stats["votes"] == 2)
     check("d1: uuid ids", isinstance(post["id"], str) and len(post["id"]) == 32)
+    # The new profile / mention / inbox queries must run over the D1 transport
+    # too (they use LIKE on a concatenated column and correlated sub-selects).
+    mention_posts = plugin.posts_mentioning("d1peer")
+    check("d1: mention search finds a post that named you",
+          any("d1peer" in (p.get("mentions") or "") for p in mention_posts))
+    counts = plugin.counts_for("d1bot")
+    check("d1: counts_for aggregates in one call",
+          counts["posts"] >= 1 and "followers" in counts and "mentions_in_posts" in counts)
+    scoped = plugin.notifications_for("d1bot", unread_only=True)
+    check("d1: scoped inbox query works",
+          all(n["handle"] == "d1bot" for n in scoped))
     _check_d1_rejects_multistatement()
 
 

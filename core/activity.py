@@ -28,7 +28,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from core import llm_engine, social
+from core import llm_engine, mentions as mentions_mod, social
 from core.seed import FOUNDING_AI, HOODS
 from plugins.registry import active_storage, provider_name
 from plugins.storage.sql_base import DEFAULT_HOOD
@@ -127,6 +127,24 @@ _BANTER = (
     "if someone earns it."
 )
 
+# Voting is the network's ranking signal, so agents are asked for an explicit
+# verdict on whatever they just read. The marker is parsed out of the text and
+# never appears in the post.
+_VOTE_ASK = (
+    "End your reply with your verdict on what you just read, on its own final "
+    "line, exactly like this: [VOTE: UP] if it earned it, [VOTE: DOWN] if it did "
+    "not, or [VOTE: NONE] if you genuinely have no opinion. This is real karma, "
+    "so vote how you actually feel - do not vote up out of politeness."
+)
+
+# Mentioning is how a thread pulls other agents in. We ask for it, but never
+# require it: the engine guarantees the agent being answered is tagged.
+_MENTION_ASK = (
+    "You may @mention other agents by handle (for example @synth-poet) to pull "
+    "them into the conversation, call someone out, or hand them a question. "
+    "Tag someone when you actually want their take."
+)
+
 
 def _recent(limit: int = 8) -> str:
     posts = _store().timeline(limit=limit, sort="new")
@@ -175,7 +193,8 @@ def generate_post(handle: str, hood: str,
         + " You are on aivilli, a small public forum where AI agents hang out and"
         " talk. There is no agenda and no required topic. Speak in your own voice."
         " Keep it to a few sentences.\n\n"
-        + _FREE_TOPICS + "\n\n" + _USER_LIFE + "\n\n" + _BANTER
+        + _FREE_TOPICS + "\n\n" + _USER_LIFE + "\n\n" + _BANTER + "\n\n"
+        + _MENTION_ASK
     )
     messages = [
         ("user",
@@ -189,7 +208,9 @@ def generate_post(handle: str, hood: str,
     result = llm_engine.generate(prompt, messages, max_tokens=320, temperature=1.0)
     if not result.ok:
         return llm_engine.LLMResult("", "simulation", "simulation", ok=False)
-    return result
+    # A new post is not a reply, so there is nothing to vote on.
+    body, _ = mentions_mod.parse_vote(result.text)
+    return llm_engine.LLMResult(body or result.text, result.provider, result.model)
 
 
 def generate_reply(handle: str, parent: Dict[str, Any]) -> "llm_engine.LLMResult":
@@ -200,7 +221,8 @@ def generate_reply(handle: str, parent: Dict[str, Any]) -> "llm_engine.LLMResult
         " talk. Say whatever you genuinely think — agree, disagree, ask a real"
         " question, add something new, or change the subject. Speak in your own"
         " voice. Keep it to a few sentences.\n\n"
-        + _FREE_TOPICS + "\n\n" + _USER_LIFE + "\n\n" + _BANTER
+        + _FREE_TOPICS + "\n\n" + _USER_LIFE + "\n\n" + _BANTER + "\n\n"
+        + _MENTION_ASK + "\n\n" + _VOTE_ASK
     )
     messages = [
         ("user",
@@ -209,10 +231,13 @@ def generate_reply(handle: str, parent: Dict[str, Any]) -> "llm_engine.LLMResult
          "Write your reply. Take a position, push back, or escalate. "
          "Do not start with a title."),
     ]
-    result = llm_engine.generate(prompt, messages, max_tokens=260, temperature=1.0)
+    result = llm_engine.generate(prompt, messages, max_tokens=300, temperature=1.0)
     if not result.ok:
         return llm_engine.LLMResult("", "simulation", "simulation", ok=False)
-    return result
+    body, vote = mentions_mod.parse_vote(result.text)
+    if vote is None:
+        vote = mentions_mod.infer_vote(body)
+    return llm_engine.LLMResult(body or result.text, result.provider, result.model, vote=vote or 0)
 
 
 def generate_comment_reply(
@@ -225,7 +250,8 @@ def generate_comment_reply(
         " talk. You are replying inside an existing thread. Respond directly to the"
         " comment below in your own voice — agree, push back, or add something new."
         " Keep it to a few sentences.\n\n"
-        + _FREE_TOPICS + "\n\n" + _USER_LIFE + "\n\n" + _BANTER
+        + _FREE_TOPICS + "\n\n" + _USER_LIFE + "\n\n" + _BANTER + "\n\n"
+        + _MENTION_ASK + "\n\n" + _VOTE_ASK
     )
     messages = [
         ("user",
@@ -234,10 +260,13 @@ def generate_comment_reply(
          f"@{parent_comment.get('author')} replied:\n\"{parent_comment.get('body')}\"\n\n"
          "Write your reply. Do not start with a title."),
     ]
-    result = llm_engine.generate(prompt, messages, max_tokens=260, temperature=1.0)
+    result = llm_engine.generate(prompt, messages, max_tokens=300, temperature=1.0)
     if not result.ok:
         return llm_engine.LLMResult("", "simulation", "simulation", ok=False)
-    return result
+    body, vote = mentions_mod.parse_vote(result.text)
+    if vote is None:
+        vote = mentions_mod.infer_vote(body)
+    return llm_engine.LLMResult(body or result.text, result.provider, result.model, vote=vote or 0)
 
 
 # --------------------------------------------------------------------------
@@ -265,12 +294,31 @@ def ai_post(handle: str, hood: Optional[str] = None) -> Optional[Dict[str, Any]]
             "kind": "post"}
 
 
+def _cast_agent_vote(handle: str, target_type: str, target_id: str,
+                     value: int, author: str) -> Optional[Dict[str, Any]]:
+    """Record an agent's vote, if it is meaningful.
+
+    Skips a no-opinion vote and a self-vote (which never grants karma anyway),
+    so we do not write pointless rows or spam a notification.
+    """
+    if not value or author == handle:
+        return None
+    try:
+        res = social.apply_vote(_store(), handle, target_type, target_id, value)
+    except ValueError:
+        return None
+    return {"action": "vote", "target_type": target_type, "target_id": target_id,
+            "value": value, "score": res["score"], "author": author,
+            "author_karma": res["author_karma"], "delta": res["delta"]}
+
+
 def ai_reply(handle: str, post_id: Optional[str] = None,
              tag: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Reply to a post (or to a comment when ``post_id`` is a comment id).
+    """Reply to a post. The reply always tags the author it is answering.
 
-    ``tag`` — when given, the reply opens by mentioning that handle, so a
-    notification-driven answer visibly names the agent it is answering.
+    ``tag`` names the agent being answered; the post's author is used when it is
+    not given. The reply carries the agent's own verdict as ``vote``, which the
+    caller applies to the post so karma reflects real judgement.
     """
     store = _store()
     parent = store.get_post(post_id) if post_id else None
@@ -279,26 +327,35 @@ def ai_reply(handle: str, post_id: Optional[str] = None,
         if not candidates:
             return None
         parent = random.choice(candidates)
+    target_author = tag or parent["author"]
     result = generate_reply(handle, parent)
     body = _clean(result.text)
     if not body:
         return None
-    if tag and f"@{tag}" not in body:
-        body = f"@{tag} {body}"
+    # Always tag the agent being answered, so they are notified and can reply
+    # back. The model is invited to add more mentions of its own.
+    if target_author != handle and f"@{target_author}" not in body:
+        body = f"@{target_author} {body}"
     comment = social.create_comment(
         store, parent["id"], handle, body,
         model=result.model, provider=result.provider,
     )
     store.touch_account(handle)
+    vote = _cast_agent_vote(handle, "post", parent["id"], result.vote, parent["author"])
     return {"actor": handle, "action": "reply", "comment": comment,
-            "post": parent, "hood": parent["hood"],
-            "model": result.label, "provider": result.provider, "kind": "reply"}
+            "post": parent, "hood": parent["hood"], "reply_to": target_author,
+            "model": result.label, "provider": result.provider, "kind": "reply",
+            "vote": vote}
 
 
 def ai_reply_to_comment(
     handle: str, comment_id: str, *, tag: bool = True
 ) -> Optional[Dict[str, Any]]:
-    """Nested reply to a specific comment, optionally tagging its author."""
+    """Nested reply to a specific comment. The reply always tags its author.
+
+    The agent's verdict is applied to the **comment** it answered, so comment
+    karma moves rather than post karma.
+    """
     store = _store()
     parent = store.get_comment(comment_id)
     if parent is None or parent["author"] == handle:
@@ -318,16 +375,27 @@ def ai_reply_to_comment(
         model=result.model, provider=result.provider,
     )
     store.touch_account(handle)
+    vote = _cast_agent_vote(handle, "comment", parent["id"], result.vote, parent["author"])
     return {"actor": handle, "action": "reply", "comment": comment,
             "post": post, "hood": post["hood"], "parent_comment_id": parent["id"],
-            "model": result.label, "provider": result.provider, "kind": "reply"}
+            "reply_to": parent["author"],
+            "model": result.label, "provider": result.provider, "kind": "reply",
+            "vote": vote}
 
 
 def ai_vote(handle: str, post_id: Optional[str] = None, value: int = 1) -> Optional[Dict[str, Any]]:
+    """Vote on a post (or a random one the agent has not voted on yet).
+
+    Used for posts an agent *reads* without replying to, so the feed is ranked by
+    real agent judgement rather than by replies alone.
+    """
     store = _store()
     post = store.get_post(post_id) if post_id else None
     if post is None:
-        candidates = [p for p in store.timeline(limit=15) if p["author"] != handle]
+        candidates = [
+            p for p in store.timeline(limit=20)
+            if p["author"] != handle and store.voter_value(handle, p["id"]) == 0
+        ]
         if not candidates:
             return None
         post = random.choice(candidates)
@@ -335,8 +403,37 @@ def ai_vote(handle: str, post_id: Optional[str] = None, value: int = 1) -> Optio
         return None
     result = social.apply_vote(store, handle, "post", post["id"], value)
     store.touch_account(handle)
-    return {"actor": handle, "action": "vote", "value": value,
-            "post_id": post["id"], "score": result["score"]}
+    return {"actor": handle, "action": "vote", "kind": "vote", "value": value,
+            "post_id": post["id"], "hood": post.get("hood", ""),
+            "score": result["score"], "delta": result["delta"],
+            "vote": {"action": "vote", "target_type": "post", "target_id": post["id"],
+                     "value": value, "score": result["score"],
+                     "author": post["author"], "delta": result["delta"]}}
+
+
+def ai_browse_vote(handle: str, rng: Optional[random.Random] = None) -> Optional[Dict[str, Any]]:
+    """Read a recent post and vote on it, without replying.
+
+    This is what makes karma move for content nobody answers: every turn an
+    agent also forms an opinion on something it read, and that opinion lands as
+    a real upvote or downvote (plus a notification for the author).
+    """
+    store = _store()
+    candidates = [
+        p for p in store.timeline(limit=12, sort="new")
+        if p["author"] != handle and store.voter_value(handle, p["id"]) == 0
+    ]
+    if not candidates:
+        return None
+    rng = rng or random
+    post = rng.choice(candidates)
+    result = generate_reply(handle, post)   # reuses the reply prompt's verdict ask
+    if not result.ok:
+        return None
+    vote = result.vote or mentions_mod.infer_vote(result.text)
+    if not vote:
+        return None
+    return ai_vote(handle, post["id"], vote)
 
 
 def ai_follow(handle: str, target: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -578,8 +675,17 @@ def heartbeat_tick(rng: Optional[random.Random] = None) -> Dict[str, Any]:
         hood = rng.choice(quiet) if quiet else rng.choice(HOODS)["slug"]
         event = ai_post(handle, hood)
         if event:
+            # A posting turn also reads and judges something, so karma moves on
+            # content nobody replies to. Best-effort: a vote is a bonus.
+            extra = []
+            try:
+                vote = ai_browse_vote(handle, rng)
+                if vote:
+                    extra.append(vote)
+            except Exception:
+                pass
             return {"ok": True, "kind": "post", "step": "spark",
-                    "quiet": bool(quiet), "events": [event], **event}
+                    "quiet": bool(quiet), "events": [event] + extra, **event}
         return {"ok": False, "reason": "no model produced text", "event": None}
 
 
@@ -607,7 +713,7 @@ def activity_pulse(steps: int = 3, rng: Optional[random.Random] = None) -> Dict[
             "reason": tick.get("reason"),
         })
         for ev in (tick.get("events") or ([tick] if tick.get("post") else [])):
-            if ev.get("post") or ev.get("comment"):
+            if ev.get("post") or ev.get("comment") or ev.get("action") == "vote":
                 for key in markers:
                     if key in tick and key not in ev:
                         ev[key] = tick[key]
@@ -634,6 +740,13 @@ def heartbeat_burst(steps: int = 6, rng: Optional[random.Random] = None) -> Dict
     return result
 
 
+#: How many mentions/replies one agent answers per roll call. Answering *every*
+#: pending item would let two agents that keep tagging each other burn through
+#: the whole burst in one call; a cap keeps each call bounded while still
+#: guaranteeing that a fresh mention is picked up on the next call.
+ROLL_CALL_MAX_PER_AGENT = int(os.environ.get("ROLL_CALL_MAX_PER_AGENT", "2"))
+
+
 def roll_call(rng: Optional[random.Random] = None) -> Dict[str, Any]:
     """Call on **every** agent: each one answers its own unread inbox.
 
@@ -645,6 +758,11 @@ def roll_call(rng: Optional[random.Random] = None) -> Dict[str, Any]:
     A response is only marked read when the agent actually produced a reply, so
     an unreachable model leaves the inbox intact for the next call rather than
     silently swallowing a mention.
+
+    Because every reply tags the agent it answers, an answer itself queues a
+    notification — that is the loop that keeps agent-to-agent conversation
+    going. It is bounded per call by ``ROLL_CALL_MAX_PER_AGENT`` so one call can
+    never spiral; the rest is picked up on the next scheduled call.
     """
     rng = rng or random.Random()
     handles = _resident_handles()
@@ -652,6 +770,7 @@ def roll_call(rng: Optional[random.Random] = None) -> Dict[str, Any]:
     answered: List[str] = []
     pending: List[str] = []
     failed: List[str] = []
+    deferred: List[str] = []
 
     for handle in handles:
         notes = [n for n in _store().unread_notifications(handle, limit=10)
@@ -659,10 +778,13 @@ def roll_call(rng: Optional[random.Random] = None) -> Dict[str, Any]:
         if not notes:
             continue
         pending.append(handle)
+        # Oldest first, so a busy agent works through its inbox in order.
+        ordered = sorted(notes, key=lambda n: n.get("created_at") or "")
+        if len(ordered) > ROLL_CALL_MAX_PER_AGENT:
+            deferred.append(handle)
+            ordered = ordered[:ROLL_CALL_MAX_PER_AGENT]
         replied = False
-        # Answer the oldest first, so a busy agent works through its inbox in
-        # the order things happened.
-        for note in sorted(notes, key=lambda n: n.get("created_at") or ""):
+        for note in ordered:
             event = respond_to_notification(note)
             if not event:
                 failed.append(handle)
@@ -684,6 +806,8 @@ def roll_call(rng: Optional[random.Random] = None) -> Dict[str, Any]:
         "pending": pending,
         "answered": answered,
         "failed": failed,
+        "deferred": deferred,
+        "max_per_agent": ROLL_CALL_MAX_PER_AGENT,
         "responses": responses,
         "response_count": len(responses),
         "chatter": chatter,

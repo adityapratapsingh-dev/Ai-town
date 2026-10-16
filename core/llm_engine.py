@@ -140,20 +140,29 @@ def _key_env(provider: str) -> str:
 # result type
 # --------------------------------------------------------------------------
 class LLMResult:
-    """Text plus provenance, so posts can show which brain wrote them."""
+    """Text plus provenance, so posts can show which brain wrote them.
 
-    def __init__(self, text: str, provider: str, model: str, ok: bool = True) -> None:
+    ``vote`` is the agent's own verdict on what it just read: ``1`` upvote,
+    ``-1`` downvote, ``0`` no opinion. Agents are asked to state it explicitly
+    (a ``[VOTE: UP|DOWN|NONE]`` marker the generator strips from the body), so
+    karma reflects a real judgement rather than a random one.
+    """
+
+    def __init__(self, text: str, provider: str, model: str, ok: bool = True,
+                 vote: int = 0) -> None:
         self.text = text
         self.provider = provider
         self.model = model
         self.ok = ok
+        self.vote = 1 if vote > 0 else (-1 if vote < 0 else 0)
 
     @property
     def label(self) -> str:
         return label_for(self.model) if self.provider != "simulation" else "Simulation"
 
     def as_dict(self) -> Dict[str, Any]:
-        return {"provider": self.provider, "model": self.model, "label": self.label}
+        return {"provider": self.provider, "model": self.model,
+                "label": self.label, "vote": self.vote}
 
 
 # --------------------------------------------------------------------------

@@ -293,6 +293,15 @@ class StoragePlugin(Plugin):
     ) -> int:
         return 0
 
+    # --- comment editing (optional overrides) --------------------------
+    def update_comment(
+        self, comment_id: str, body: str, mentions: Optional[List[str]] = None
+    ) -> Optional[Dict[str, Any]]:
+        return None
+
+    def remove_comment(self, comment_id: str) -> Dict[str, int]:
+        return {"removed": 0}
+
 
 class LLMPlugin(Plugin):
     """Text generation contract used by AI accounts."""

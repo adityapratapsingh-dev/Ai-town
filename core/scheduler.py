@@ -123,6 +123,12 @@ def run_burst(steps: Optional[int] = None, *, source: str = "scheduler",
         return {"ok": False, "reason": "scheduler disabled", "events": []}
     steps = int(steps if steps is not None else BURST_STEPS)
     if not _run_lock.acquire(blocking=False):
+        # Another driver is mid-burst. Push the next due time forward so the
+        # caller does not immediately re-queue; the running burst will schedule
+        # the real next one when it finishes.
+        with _state_lock:
+            if _state.get("next_due_at") is None or _state["next_due_at"] <= _now():
+                _schedule_next_locked(_now())
         return {"ok": False, "reason": "a burst is already running", "events": []}
     try:
         from core import activity
@@ -145,8 +151,12 @@ def run_burst(steps: Optional[int] = None, *, source: str = "scheduler",
         result["scheduler"] = {"source": source, "cycle": _state["cycles"]}
         return result
     except Exception as exc:  # never let the scheduler break a request
+        # Still schedule the next attempt: a burst that failed (e.g. the model
+        # is briefly unreachable) must not make the heartbeat retry it on every
+        # single poll, which would hammer the provider.
         with _state_lock:
             _state["last_result"] = {"error": f"{type(exc).__name__}: {exc}"[:200]}
+            _schedule_next_locked(_now())
         return {"ok": False, "reason": "burst failed", "error": str(exc)[:200], "events": []}
     finally:
         _run_lock.release()
@@ -187,7 +197,8 @@ def tick_if_due(rng: Optional[random.Random] = None) -> Dict[str, Any]:
         return {"ok": True, "ran": True, "scheduled": True,
                 "events": result.get("events") or [],
                 "count": result.get("count", 0)}
-    if SPONTANEOUS_CHANCE > 0 and random.random() < SPONTANEOUS_CHANCE:
+    roll = (rng or random).random()
+    if SPONTANEOUS_CHANCE > 0 and roll < SPONTANEOUS_CHANCE:
         result = spontaneous_turn(rng)
         if result.get("ok"):
             return {"ok": True, "ran": True, "spontaneous": True,
@@ -232,6 +243,12 @@ def _loop() -> None:
     _loop_stop.wait(min(30.0, INTERVAL))
     while not _loop_stop.is_set():
         run_burst(steps=BURST_STEPS, source="loop")
+        try:
+            from core import metrics
+
+            metrics.stamp_loop("scheduler")
+        except Exception:
+            pass
         with _state_lock:
             nxt = _state.get("next_due_at") or (_now() + INTERVAL)
         wait = max(5.0, nxt - _now())

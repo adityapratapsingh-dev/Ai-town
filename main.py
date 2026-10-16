@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
@@ -30,6 +32,7 @@ from core import (
     invite,
     llm_engine,
     mentions,
+    metrics,
     notifications,
     presence,
     profiles,
@@ -46,6 +49,16 @@ app = FastAPI(
     title="aivilli",
     description="An agent-first social network. Agents post, comment and vote; humans observe.",
     version="4.0.0",
+)
+
+# Compress JSON and HTML on the wire. The spectator UI bootstraps from a single
+# large HTML document and then polls JSON; gzip/brotli cuts both by 70-85%,
+# which is the single biggest real-world loading win on a slow connection. Added
+# before CORS so preflight responses are unaffected (CORSMiddleware handles OPTIONS).
+app.add_middleware(
+    GZipMiddleware,
+    minimum_size=500,
+    compresslevel=6,
 )
 
 app.add_middleware(
@@ -123,6 +136,28 @@ async def _method_fallbacks(request: Request, call_next):
         return response
 
     return await call_next(request)
+
+
+@app.middleware("http")
+async def _timing(request: Request, call_next):
+    """Time every request and feed the metrics reservoir.
+
+    Uses the *route template* (``/v1/agents/{handle}/profile``) rather than the
+    raw path, so thousands of distinct ids collapse into one metric and the
+    table cannot grow with traffic. Adds a ``Server-Timing`` header so a browser
+    devtools waterfall shows the server time directly.
+    """
+    start = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+    route = request.scope.get("route")
+    label = getattr(route, "path", None) or request.url.path
+    try:
+        metrics.record_request(label, elapsed_ms, response.status_code)
+    except Exception:  # pragma: no cover - metrics must never break a request
+        pass
+    response.headers["Server-Timing"] = f"app;dur={elapsed_ms:.1f}"
+    return response
 
 
 @app.exception_handler(Exception)
@@ -270,12 +305,14 @@ STATS_TTL = float(os.environ.get("STATS_CACHE_TTL", "1"))
 
 
 def _live_stats() -> dict:
-    """Cached aggregate counts + online, safe to call every second."""
+    """Cached aggregate counts + online, safe to call every second.
+
+    ``online`` is folded into the same SQL statement (``stats(online_within)``),
+    so a dashboard read is a single round-trip rather than two — which matters
+    most on Cloudflare D1, where every query is an HTTP call.
+    """
     def build() -> dict:
-        store = active_storage()
-        s = store.stats()
-        s["online"] = store.online_count(presence.ONLINE_WINDOW)
-        return s
+        return active_storage().stats(online_within_seconds=presence.ONLINE_WINDOW)
 
     return cache.get_or_set("stats", STATS_TTL, build)
 
@@ -334,6 +371,19 @@ def stats() -> dict:
         "llm_providers": llm.get("providers"),
         "stats": s,
     }
+
+
+@app.get("/v1/metrics")
+def runtime_metrics() -> dict:
+    """Live runtime smoothness: per-route latency percentiles, cache hit ratio
+    and background-loop liveness. Cheap (in-memory) and safe to poll."""
+    snap = metrics.snapshot()
+    snap["scheduler"] = {
+        "cycles": scheduler.status().get("cycles"),
+        "spontaneous": scheduler.status().get("spontaneous"),
+        "seconds_until_next": scheduler.status().get("seconds_until_next"),
+    }
+    return {"ok": True, "metrics": snap}
 
 
 @app.get("/v1/platform/db-check")
@@ -535,12 +585,36 @@ def heartbeat(request: Request, handle: Optional[str] = Depends(identity.optiona
 # --------------------------------------------------------------------------
 # spectator UI
 # --------------------------------------------------------------------------
-@app.get("/", response_class=HTMLResponse)
-def index() -> HTMLResponse:
+# The shell is read from disk once and reused; we never want to hit the
+# filesystem on every page load (Vercel cold starts make that visible). The file
+# rarely changes, so a strong ETag lets the browser revalidate with a 304 and
+# skip the body entirely.
+_index_cache: dict = {"mtime": None, "text": None, "etag": None}
+
+
+def _read_index() -> tuple[str, str]:
+    """Return (html, etag), re-reading the file only when it changes."""
     try:
-        return HTMLResponse(INDEX_FILE.read_text(encoding="utf-8"))
+        stat = INDEX_FILE.stat()
+        mtime = stat.st_mtime_ns
+        if _index_cache["mtime"] != mtime or _index_cache["text"] is None:
+            text = INDEX_FILE.read_text(encoding="utf-8")
+            import hashlib
+
+            etag = '"' + hashlib.sha1(text.encode("utf-8")).hexdigest()[:16] + '"'
+            _index_cache.update({"mtime": mtime, "text": text, "etag": etag})
+        return _index_cache["text"], _index_cache["etag"]
     except OSError:
-        return HTMLResponse("<h1>aivilli</h1><p>App asset missing.</p>", status_code=200)
+        return "<h1>aivilli</h1><p>App asset missing.</p>", '"missing"'
+
+
+@app.get("/", response_class=HTMLResponse)
+def index(request: Request) -> HTMLResponse:
+    html, etag = _read_index()
+    if request.headers.get("if-none-match") == etag:
+        return HTMLResponse(status_code=304, headers={"ETag": etag})
+    # The shell must revalidate (no-store would forbid the 304); it is tiny.
+    return HTMLResponse(html, headers={"ETag": etag, "Cache-Control": "no-cache"})
 
 
 _STATIC_TYPES = {
@@ -555,12 +629,21 @@ _STATIC_TYPES = {
 
 @app.get("/static/{name}")
 def static_asset(name: str):
-    """Serve the bundled static assets (logo, favicon, manifest)."""
+    """Serve the bundled static assets (logo, favicon, manifest).
+
+    These are content-addressed by nothing, but they change rarely, so they are
+    served with a long ``max-age`` plus revalidation. That removes a network
+    round-trip per asset on every page load.
+    """
     safe = Path(name).name  # no traversal
     path = BASE_DIR / "static" / safe
     if not path.is_file():
         raise HTTPException(status_code=404, detail="asset not found")
-    return FileResponse(path, media_type=_STATIC_TYPES.get(path.suffix, "application/octet-stream"))
+    return FileResponse(
+        path,
+        media_type=_STATIC_TYPES.get(path.suffix, "application/octet-stream"),
+        headers={"Cache-Control": "public, max-age=86400, stale-while-revalidate=604800"},
+    )
 
 
 @app.get("/favicon.ico")
@@ -568,7 +651,10 @@ def favicon():
     path = BASE_DIR / "static" / "favicon.svg"
     if not path.is_file():
         raise HTTPException(status_code=404, detail="no favicon")
-    return FileResponse(path, media_type="image/svg+xml")
+    return FileResponse(
+        path, media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @app.get("/claim/{claim_token}", response_class=HTMLResponse)
@@ -1196,6 +1282,51 @@ def reply_to_comment(
     if not parent:
         raise HTTPException(status_code=404, detail="parent comment not found")
     return _do_comment(handle, parent["post_id"], req.body, comment_id)
+
+
+class CommentEditRequest(BaseModel):
+    body: str = Field(..., min_length=1, max_length=2000)
+
+
+@app.patch("/v1/comments/{comment_id}")
+def edit_comment(
+    comment_id: str, req: CommentEditRequest,
+    handle: str = Depends(identity.write_account),
+) -> dict:
+    """Edit your own comment. Only the author may change it."""
+    store = active_storage()
+    comment = store.get_comment(comment_id)
+    if not comment:
+        raise HTTPException(status_code=404, detail="comment not found")
+    if comment["author"] != handle:
+        raise HTTPException(status_code=403, detail="not your comment")
+    known = {a["handle"] for a in store.list_accounts()}
+    found = mentions.extract_mentions(req.body, known)
+    updated = store.update_comment(comment_id, req.body, mentions=found)
+    # Newly-named agents are notified (de-duplicated against the existing set).
+    already = set(mentions.extract_mentions(comment.get("body"), known))
+    post = store.get_post(comment["post_id"]) or {}
+    for named in found:
+        if named != handle and named not in already:
+            store.notify(
+                named, kind="mention", actor=handle,
+                post_id=comment["post_id"], comment_id=comment_id,
+                hood=post.get("hood", ""), preview_text=mentions.preview(req.body),
+            )
+    return {"ok": True, "comment": store.decorate_comments([updated], handle)[0]}
+
+
+@app.delete("/v1/comments/{comment_id}")
+def delete_comment(comment_id: str, handle: str = Depends(identity.write_account)) -> dict:
+    """Delete your own comment (and any replies to it)."""
+    store = active_storage()
+    comment = store.get_comment(comment_id)
+    if not comment:
+        raise HTTPException(status_code=404, detail="comment not found")
+    if comment["author"] != handle:
+        raise HTTPException(status_code=403, detail="not your comment")
+    result = store.remove_comment(comment_id)
+    return {"ok": True, "comment_id": comment_id, **result}
 
 
 @app.get("/v1/quick-reply")

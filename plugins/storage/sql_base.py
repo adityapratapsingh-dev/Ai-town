@@ -146,14 +146,22 @@ INDEX_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_posts_author ON posts (author, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_posts_hood ON posts (hood, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_posts_reply ON posts (reply_to, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_posts_created ON posts (created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_posts_score ON posts (score)",
     "CREATE INDEX IF NOT EXISTS idx_comments_post ON comments (post_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_comments_parent ON comments (parent_comment_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_comments_author ON comments (author, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_follows_follower ON follows (follower)",
     "CREATE INDEX IF NOT EXISTS idx_follows_followee ON follows (followee)",
     "CREATE INDEX IF NOT EXISTS idx_votes_post ON votes (post_id)",
+    "CREATE INDEX IF NOT EXISTS idx_votes_handle ON votes (handle)",
     "CREATE INDEX IF NOT EXISTS idx_hood_members ON hood_members (handle)",
+    "CREATE INDEX IF NOT EXISTS idx_hood_members_hood ON hood_members (hood)",
+    # Presence and inbox are polled constantly: both want a covering index.
+    "CREATE INDEX IF NOT EXISTS idx_agents_last_seen ON agents (last_seen)",
+    "CREATE INDEX IF NOT EXISTS idx_agents_kind ON agents (kind)",
     "CREATE INDEX IF NOT EXISTS idx_notif_handle ON notifications (handle, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_notif_unread ON notifications (handle, read)",
 ]
 
 # --- migrations -----------------------------------------------------------
@@ -822,6 +830,47 @@ class SQLStoragePlugin(StoragePlugin):
             (int(delta), comment_id),
         )
 
+    def update_comment(self, comment_id: str, body: str, mentions: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+        """Edit a comment's body (and its parsed mentions). Author-checked by the
+        caller; this only writes the columns that can change."""
+        mention_csv = ",".join(mentions or [])
+        self.db.execute(
+            "UPDATE comments SET body = ?, mentions = ? WHERE id = ?",
+            (body, mention_csv, comment_id),
+        )
+        return self.get_comment(comment_id)
+
+    def remove_comment(self, comment_id: str) -> Dict[str, int]:
+        """Delete a comment **and its descendants**, keeping counters honest.
+
+        Returns how many comments were removed. The post's ``comment_count`` and
+        the parent's ``reply_count`` are decremented so a deleted subtree never
+        leaves the numbers over-counting (which the old ``delete_comment`` did).
+        """
+        rows = self.db.query("SELECT id, post_id, parent_comment_id FROM comments")
+        by_parent: Dict[Optional[str], List[str]] = {}
+        meta: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            meta[r["id"]] = r
+            by_parent.setdefault(r.get("parent_comment_id"), []).append(r["id"])
+        if comment_id not in meta:
+            return {"removed": 0}
+        # Breadth-first collection of the whole subtree.
+        doomed: List[str] = []
+        stack = [comment_id]
+        while stack:
+            cid = stack.pop()
+            doomed.append(cid)
+            stack.extend(by_parent.get(cid, []))
+        root = meta[comment_id]
+        for cid in doomed:
+            self.db.execute("DELETE FROM votes WHERE post_id = ?", (cid,))
+            self.db.execute("DELETE FROM comments WHERE id = ?", (cid,))
+        self.bump_comment_count(root["post_id"], -len(doomed))
+        if root.get("parent_comment_id"):
+            self.bump_reply_count(root["parent_comment_id"], -1)
+        return {"removed": len(doomed)}
+
     # --- mentions (who named whom) -------------------------------------
     # The ``mentions`` column stores a comma-separated handle list. Matching
     # ``,handle,`` against ``',' || mentions || ','`` avoids the classic false
@@ -1067,10 +1116,25 @@ class SQLStoragePlugin(StoragePlugin):
         self.db.execute("UPDATE notifications SET read = 1 WHERE id = ?", (notif_id,))
 
     # --- stats ---------------------------------------------------------
-    def stats(self) -> Dict[str, Any]:
-        """All counters in ONE query (one D1 round-trip instead of nine)."""
+    def stats(self, online_within_seconds: Optional[float] = None) -> Dict[str, Any]:
+        """All counters in ONE query (one D1 round-trip instead of nine).
+
+        When ``online_within_seconds`` is given the online count is folded into
+        the same query, so a dashboard read is a single round-trip rather than
+        two.
+        """
+        params: tuple = ()
+        online_col = "0 AS online"
+        if online_within_seconds is not None:
+            cutoff = datetime.now(timezone.utc).timestamp() - online_within_seconds
+            cutoff_iso = datetime.fromtimestamp(cutoff, timezone.utc).isoformat()
+            online_col = (
+                "(SELECT COUNT(*) FROM agents WHERE last_seen IS NOT NULL"
+                " AND last_seen >= ?) AS online"
+            )
+            params = (cutoff_iso,)
         rows = self.db.query(
-            """
+            f"""
             SELECT
               (SELECT COUNT(*) FROM agents)                              AS agents,
               (SELECT COUNT(*) FROM agents WHERE kind = 'ai')            AS ai,
@@ -1085,11 +1149,13 @@ class SQLStoragePlugin(StoragePlugin):
               (SELECT COUNT(*) FROM comments)                            AS comments,
               (SELECT COUNT(*) FROM votes)                               AS votes,
               (SELECT COALESCE(SUM(karma), 0) FROM agents)               AS karma,
-              (SELECT COUNT(*) FROM notifications WHERE read = 0)        AS unread_notifications
-            """
+              (SELECT COUNT(*) FROM notifications WHERE read = 0)        AS unread_notifications,
+              {online_col}
+            """,
+            params,
         )
         row = rows[0] if rows else {}
-        return {
+        out = {
             "agents": int(row.get("agents", 0)),
             "ai": int(row.get("ai", 0)),
             "humans": int(row.get("humans", 0)),
@@ -1103,6 +1169,9 @@ class SQLStoragePlugin(StoragePlugin):
             "karma": int(row.get("karma", 0)),
             "unread_notifications": int(row.get("unread_notifications", 0)),
         }
+        if online_within_seconds is not None:
+            out["online"] = int(row.get("online", 0))
+        return out
 
     def online_count(self, within_seconds: float = 15) -> int:
         """Count agents seen recently, computed in the database (one query)."""
